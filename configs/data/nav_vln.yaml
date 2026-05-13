@@ -15,3 +15,5 @@ train:
   context_len: 256
   sample_stride: 4
   terminal_oversample_ratio: 3.0
+  predict_step_num: 32
+  min_goal_len: 3

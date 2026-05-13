@@ -9,17 +9,23 @@ Architecture:
   - 8 future frames (125cm_0deg): for video generation training
   - 1 overhead frame (125cm_30deg): at current timestep, separate conditioning
   - Total 0deg video: 17 frames (T%4==1 ✓) → 5 VAE latent frames
-  - Action: 32 relative waypoints starting from current frame
+  - Action: predict_step_num relative waypoints (cubic spline resampled)
 
 Each sample contains:
   - video: [C, 17, H, W] — 0deg single-camera RGB video (9 cond + 8 future)
   - overhead: [C, H, W] — 30deg overhead frame at current timestep
-  - action: [32, 3] — relative (x, y, theta) trajectory waypoints
-  - action_is_pad: [32] — padding mask for action
+  - action: [predict_step_num, action_dim] — relative (x, y, theta, moving_flag) trajectory
+  - action_is_pad: [predict_step_num] — padding mask for action
   - context: [context_len, text_dim] — cached T5 text embedding
   - context_mask: [context_len] — text mask
   - image_is_pad: [17] — video frame padding mask
   - n_cond_frames: int — number of condition frames (9)
+
+Sampling strategy (aligned with InternNav):
+  - Start frames are sampled with stride `sample_step` within each episode
+  - End frames are determined by pre-annotated `pixel_goals` (relative_goal_frame_id)
+  - Trajectories between start and end are smoothed via cubic spline interpolation
+    and resampled to fixed `predict_step_num` waypoints at equal distance intervals
 """
 
 import hashlib
@@ -34,6 +40,7 @@ import pandas as pd
 import torch
 import torchvision.transforms.functional as transforms_F
 from PIL import Image
+from scipy.interpolate import CubicSpline
 
 from fastwam.utils.logging_config import get_logger
 
@@ -42,21 +49,212 @@ logger = get_logger(__name__)
 DEFAULT_PROMPT = "A video recorded from a navigation agent's point of view executing the following instruction: {task}"
 
 
+# =============================================================================
+# Trajectory processing utilities (aligned with InternNav)
+# =============================================================================
+
+
+def get_trajectory_relative_to_frame(extrinsics: np.ndarray, camera_deg: float = 0) -> np.ndarray:
+    """
+    Calculate trajectory poses (x, y, yaw) relative to the first frame.
+
+    Args:
+        extrinsics: Sequence of 4x4 extrinsic matrices, shape (N, 4, 4).
+        camera_deg: Camera pitch angle in degrees.
+
+    Returns:
+        relative_xyyaw: shape (N, 3) — (x, y, yaw) relative to frame[0].
+    """
+    T_camera2robot = np.array(
+        [[[0.0, -1.0, 0.0, 0.0], [0.0, 0.0, -1.0, 0.0], [1.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]]]
+    )
+    T_robot2camera = np.array(
+        [[[0.0, 0.0, 1.0, 0.0], [-1.0, 0.0, 0.0, 0.0], [0.0, -1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]]]
+    )
+
+    if camera_deg is not None and camera_deg != 0:
+        camera_rad = np.radians(camera_deg)
+        T_deg = np.array(
+            [
+                [
+                    [1.0, 0.0, 0.0, 0.0],
+                    [0.0, np.cos(-camera_rad), -np.sin(-camera_rad), 0.0],
+                    [0.0, np.sin(-camera_rad), np.cos(-camera_rad), 0.0],
+                    [0.0, 0.0, 0.0, 1.0],
+                ]
+            ],
+            dtype=np.float32,
+        )
+        T_robot2camera = np.matmul(T_robot2camera, T_deg)
+        T_camera2robot = np.linalg.inv(T_robot2camera)
+
+    extrinsics_robot = np.matmul(extrinsics, T_camera2robot)
+
+    T_ref = extrinsics_robot[0]
+    T_ref_inv = np.linalg.inv(T_ref)
+
+    relative_to_ref = np.matmul(T_ref_inv[np.newaxis, :, :], extrinsics_robot)
+
+    relative_translations = relative_to_ref[:, :2, 3]
+    relative_yaws = np.arctan2(relative_to_ref[:, 1, 0], relative_to_ref[:, 0, 0])
+
+    relative_xyyaw = np.concatenate((relative_translations, relative_yaws.reshape(-1, 1)), axis=-1)
+    return relative_xyyaw
+
+
+def smooth_and_resample_trajectory(points: np.ndarray, sample_length: int = 33, interval: float = 0.1) -> np.ndarray:
+    """
+    Smooth trajectory with cubic spline and resample at equal distance intervals.
+
+    Args:
+        points: (M, 2) array of x,y waypoints.
+        sample_length: Number of output points.
+        interval: Distance between consecutive output points (meters).
+
+    Returns:
+        resampled: (sample_length, 2) array.
+    """
+    total_distance = sample_length * interval
+
+    if len(points) == 0:
+        return np.zeros((sample_length, 2))
+
+    if len(points) == 1:
+        return np.tile(points[0], (sample_length, 1))
+
+    diff = np.diff(points, axis=0)
+    segment_lengths = np.sqrt(np.sum(diff**2, axis=1))
+    cumulative_distances = np.cumsum(segment_lengths)
+    cumulative_distances = np.insert(cumulative_distances, 0, 0)
+
+    if len(points) > 3:
+        cs_x = CubicSpline(cumulative_distances, points[:, 0])
+        cs_y = CubicSpline(cumulative_distances, points[:, 1])
+
+        dense_distances = np.linspace(0, cumulative_distances[-1], max(50, len(points) * 2))
+        x_smooth = cs_x(dense_distances)
+        y_smooth = cs_y(dense_distances)
+        smoothed_points = np.column_stack((x_smooth, y_smooth))
+
+        smooth_diff = np.diff(smoothed_points, axis=0)
+        smooth_segment_lengths = np.sqrt(np.sum(smooth_diff**2, axis=1))
+        smooth_cumulative_distances = np.cumsum(smooth_segment_lengths)
+        smooth_cumulative_distances = np.insert(smooth_cumulative_distances, 0, 0)
+    else:
+        smoothed_points = points
+        smooth_cumulative_distances = cumulative_distances
+
+    target_distances = np.linspace(0, total_distance, sample_length)
+
+    resampled = np.zeros((sample_length, 2))
+
+    for i, target_dist in enumerate(target_distances):
+        if target_dist >= smooth_cumulative_distances[-1]:
+            resampled[i] = smoothed_points[-1]
+            continue
+
+        segment_idx = np.searchsorted(smooth_cumulative_distances, target_dist, side='right') - 1
+        start_dist = smooth_cumulative_distances[segment_idx]
+        end_dist = smooth_cumulative_distances[segment_idx + 1]
+        t = (target_dist - start_dist) / (end_dist - start_dist + 1e-8)
+
+        resampled[i] = smoothed_points[segment_idx] + t * (
+            smoothed_points[segment_idx + 1] - smoothed_points[segment_idx]
+        )
+
+    return resampled
+
+
+def xy_to_delta_xyt(xy_actions: np.ndarray) -> np.ndarray:
+    """
+    Convert absolute (x, y) positions to relative (dx, dy, delta_yaw).
+
+    Args:
+        xy_actions: (N, 2) array of absolute positions.
+
+    Returns:
+        delta_xyt: (N-1, 3) array of (dx, dy, delta_yaw).
+    """
+    vectors = np.diff(xy_actions, axis=0)
+    yaw = np.arctan2(vectors[:, 1], vectors[:, 0])
+
+    delta_yaw = np.diff(yaw)
+    delta_yaw = (delta_yaw + np.pi) % (2 * np.pi) - np.pi
+
+    delta_yaw = np.concatenate([[yaw[0]], delta_yaw])
+
+    delta_xyt = np.concatenate([vectors, delta_yaw[:, None]], axis=1)
+    return delta_xyt
+
+
+def interpolate_and_resample_trajectory(
+    absolute_trajectories: np.ndarray, predict_step_num: int = 32
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Full pipeline: filter static points → cubic spline → equal-distance resample.
+
+    Args:
+        absolute_trajectories: (N, 3) relative (x, y, yaw) from get_trajectory_relative_to_frame.
+        predict_step_num: Number of output action steps.
+
+    Returns:
+        resampled_trajectories: (predict_step_num + 1, 2) resampled xy positions.
+        resampled_relative_poses: (predict_step_num, 3) delta (dx, dy, d_yaw) actions.
+    """
+    start_point = np.array([[0.0, 0.0]])
+
+    traj = absolute_trajectories[..., :2]
+    steps = traj[1:] - traj[:-1]
+    steps_sq = (steps**2).sum(axis=-1)
+    mask = steps_sq > 0.05
+
+    filtered_traj = traj[1:][mask]
+    filtered_traj = np.concatenate([start_point, filtered_traj], axis=0)
+
+    resampled_trajectories = smooth_and_resample_trajectory(filtered_traj, sample_length=predict_step_num + 1)
+    resampled_relative_poses = xy_to_delta_xyt(resampled_trajectories)
+
+    resampled_relative_poses[:, 0:2] *= 4  # normalization factor
+
+    return resampled_trajectories, resampled_relative_poses
+
+
+def clip_or_pad(arr: np.ndarray, fixed_len: int) -> np.ndarray:
+    """Clip or zero-pad array to fixed length along dim 0."""
+    T, D = arr.shape
+    if T >= fixed_len:
+        return arr[:fixed_len]
+    else:
+        pad = np.zeros((fixed_len - T, D), dtype=arr.dtype)
+        return np.concatenate([arr, pad], axis=0)
+
+
+# =============================================================================
+# Dataset
+# =============================================================================
+
+
 class NavVideoDataset(torch.utils.data.Dataset):
     """
     Dataset for VLN navigation trajectories with multi-frame history + overhead conditioning.
 
+    Uses InternNav-style sampling:
+    - Start frames at fixed stride (sample_step)
+    - End frames determined by pixel_goals annotations
+    - Action labels generated via cubic spline interpolation + equal-distance resampling
+
     Args:
         dataset_dirs: List of scene root directories.
         camera_keys: [primary_camera, overhead_camera], e.g. ["125cm_0deg", "125cm_30deg"].
-        num_frames: Total trajectory steps spanned per sample (default 33 = 32 action steps + 1).
+        num_frames: Total trajectory steps spanned per sample (used for video frame count).
         n_history_frames: Number of past frames to include as condition (default 8).
         n_future_video_frames: Number of future frames for video generation (default 8).
         video_size: [H, W] for each single-camera frame.
         text_embedding_cache_dir: Path to pre-computed text embeddings.
         context_len: Text context length.
         sample_stride: Stride for sampling start frames within episodes.
-        terminal_oversample_ratio: How much more to sample near trajectory end (default 3.0).
+        terminal_oversample_ratio: How much more to sample near trajectory end.
+        predict_step_num: Number of action waypoints to predict (after resampling).
     """
 
     def __init__(
@@ -73,7 +271,8 @@ class NavVideoDataset(torch.utils.data.Dataset):
         context_len: int = 256,
         sample_stride: int = 4,
         terminal_oversample_ratio: float = 3.0,
-        # Unused kwargs for compatibility with hydra config
+        predict_step_num: int = 32,
+        min_goal_len: int = 3,
         **kwargs,
     ):
         super().__init__()
@@ -85,28 +284,34 @@ class NavVideoDataset(torch.utils.data.Dataset):
         self.primary_camera = camera_keys[0]  # 125cm_0deg
         self.overhead_camera = camera_keys[1] if len(camera_keys) > 1 else camera_keys[0]
         self.camera_keys = camera_keys
-        self.num_frames = num_frames  # trajectory span (33 = 32 action steps + 1)
-        self.n_history_frames = n_history_frames  # 8
-        self.n_future_video_frames = n_future_video_frames  # 8
-        self.action_video_freq_ratio = action_video_freq_ratio  # 4
-        self.video_size = video_size  # [224, 224] single camera
+        self.num_frames = num_frames
+        self.n_history_frames = n_history_frames
+        self.n_future_video_frames = n_future_video_frames
+        self.action_video_freq_ratio = action_video_freq_ratio
+        self.video_size = video_size
         self.text_embedding_cache_dir = text_embedding_cache_dir
         self.context_len = context_len
         self.sample_stride = sample_stride
         self.terminal_oversample_ratio = terminal_oversample_ratio
+        self.predict_step_num = predict_step_num
+        self.min_goal_len = min_goal_len
 
-        # Action parameters
-        self.num_action_steps = num_frames - 1  # 32
+        # Action output dimension: (dx, dy, d_theta, moving_flag)
+        self.action_dim = 4
+        self.num_action_steps = predict_step_num
 
-        # Total video frames for VAE: history + current + future = 9 + 8 = 17
-        self.n_cond_frames = n_history_frames + 1  # 9 (frozen in latent space)
+        # Total video frames: history + current + future = 9 + 8 = 17
+        self.n_cond_frames = n_history_frames + 1  # 9
         self.total_video_frames = self.n_cond_frames + n_future_video_frames  # 17
         assert self.total_video_frames % 4 == 1, (
             f"Total video frames must satisfy T%4==1 for VAE, got {self.total_video_frames}"
         )
 
-        # Future frame stride: span 32 action steps with n_future_video_frames frames
-        self.future_frame_stride = self.num_action_steps // n_future_video_frames  # 4
+        # Future frame stride: determined by goal_len at runtime, but video needs fixed frames
+        self.future_frame_stride = (num_frames - 1) // n_future_video_frames  # 4
+
+        # Camera pitch for coordinate transform (extract from camera key)
+        self._camera_deg = self._parse_camera_deg(self.overhead_camera)
 
         # Build index
         self.samples = []
@@ -115,11 +320,32 @@ class NavVideoDataset(torch.utils.data.Dataset):
             f"NavVideoDataset: {len(self.samples)} samples from {len(dataset_dirs)} dataset dirs, "
             f"primary_cam={self.primary_camera}, overhead_cam={self.overhead_camera}, "
             f"n_history={n_history_frames}, n_future_video={n_future_video_frames}, "
-            f"total_video_frames={self.total_video_frames}, action_steps={self.num_action_steps}"
+            f"total_video_frames={self.total_video_frames}, predict_step_num={predict_step_num}"
         )
 
+    @staticmethod
+    def _parse_camera_deg(camera_key: str) -> float:
+        """Extract pitch degrees from camera key like '125cm_30deg'."""
+        parts = camera_key.replace("deg", "").split("_")
+        for part in parts:
+            if part.isdigit() and int(part) <= 90:
+                deg = int(part)
+                if deg > 0:
+                    return float(deg)
+        return 0.0
+
     def _build_index(self, dataset_dirs: List[str]):
-        """Scan all scenes and episodes to build sample index with terminal oversampling."""
+        """
+        Scan all scenes and episodes to build sample index using pixel_goals.
+
+        For each episode, sample start frames at stride `sample_stride`. For each start frame,
+        check if a valid pixel_goal exists (goal_len >= min_goal_len). If so, record the sample
+        with the goal-determined endpoint.
+        """
+        n_skipped_no_goal = 0
+        n_skipped_short = 0
+        n_skipped_no_columns = 0
+
         for dataset_dir in dataset_dirs:
             if not os.path.isdir(dataset_dir):
                 logger.warning(f"Dataset dir not found: {dataset_dir}")
@@ -149,44 +375,91 @@ class NavVideoDataset(torch.utils.data.Dataset):
                     tasks = ep_info.get("tasks", [])
                     instruction = tasks[0] if tasks else ""
 
-                    # Need at least n_history_frames + 1 (current) to form a valid sample
-                    min_current_idx = self.n_history_frames
-                    if ep_length <= min_current_idx:
+                    if ep_length < self.n_history_frames + self.min_goal_len:
                         continue
 
-                    # Create samples: current_idx ranges from n_history_frames to ep_length-1
-                    # The "current frame" is where the agent is NOW; history is behind, future is ahead
-                    max_current_idx = ep_length - 1
+                    # Load parquet to get pixel_goals and actions
+                    parquet_path = os.path.join(
+                        scene_path, "data", "chunk-000",
+                        f"episode_{ep_idx:06d}.parquet"
+                    )
+                    if not os.path.isfile(parquet_path):
+                        continue
 
-                    for current_idx in range(min_current_idx, max_current_idx + 1, self.sample_stride):
+                    try:
+                        goal_col = f"relative_goal_frame_id.{self.overhead_camera}"
+                        action_col = "action"
+                        df = pd.read_parquet(parquet_path, columns=[goal_col, action_col])
+                    except Exception:
+                        # Columns might not exist in this parquet
+                        n_skipped_no_columns += 1
+                        continue
+
+                    if goal_col not in df.columns:
+                        n_skipped_no_columns += 1
+                        continue
+
+                    pixel_goal_frame_ids = df[goal_col].tolist()
+                    actions = df[action_col].tolist()
+                    # Shift actions: actions[i] = actions[i+1] in InternNav convention
+                    actions = actions[1:] + [0]
+
+                    # Sample start frames with stride
+                    num_rounds = ep_length // self.sample_stride
+                    for n in range(num_rounds + 1):
+                        start_frame_id = n * self.sample_stride
+                        if start_frame_id >= ep_length - 1:
+                            continue
+
+                        goal_len = int(pixel_goal_frame_ids[start_frame_id])
+
+                        # Skip frames without a visible goal
+                        if goal_len == -1:
+                            n_skipped_no_goal += 1
+                            continue
+
+                        # Skip too-short goals
+                        if goal_len < self.min_goal_len:
+                            n_skipped_short += 1
+                            continue
+
+                        end_frame_id = start_frame_id + goal_len + 1
+                        end_frame_id = min(end_frame_id, ep_length)
+
                         self.samples.append({
                             "scene_path": scene_path,
                             "episode_idx": ep_idx,
-                            "current_idx": current_idx,
+                            "start_frame_id": start_frame_id,
+                            "end_frame_id": end_frame_id,
                             "episode_length": ep_length,
                             "instruction": instruction,
                         })
 
-                    # Terminal oversampling: add extra samples near the end
-                    # (last 20% of trajectory, with stride=1)
-                    terminal_start = max(min_current_idx, int(ep_length * 0.8))
-                    for current_idx in range(terminal_start, max_current_idx + 1):
-                        # Add extra copies based on terminal_oversample_ratio
-                        n_extra = int(self.terminal_oversample_ratio) - 1
+                    # Terminal oversampling: add STOP samples near trajectory end
+                    terminal_start = max(0, ep_length - 5)
+                    for current_idx in range(terminal_start, ep_length):
+                        n_extra = int(self.terminal_oversample_ratio)
                         for _ in range(n_extra):
                             self.samples.append({
                                 "scene_path": scene_path,
                                 "episode_idx": ep_idx,
-                                "current_idx": current_idx,
+                                "start_frame_id": current_idx,
+                                "end_frame_id": ep_length,  # at the end = STOP
                                 "episode_length": ep_length,
                                 "instruction": instruction,
                             })
 
+        logger.info(
+            f"Index built: {len(self.samples)} samples. "
+            f"Skipped: no_goal={n_skipped_no_goal}, short={n_skipped_short}, "
+            f"no_columns={n_skipped_no_columns}"
+        )
+
     def __len__(self):
         return len(self.samples)
 
-    def _load_image(self, scene_path: str, camera_key: str, episode_idx: int, frame_idx: int) -> torch.Tensor:
-        """Load a single image as tensor [C, H, W] in [0, 1]."""
+    def _load_and_resize_frame(self, scene_path: str, camera_key: str, episode_idx: int, frame_idx: int) -> torch.Tensor:
+        """Load and resize a single frame to target video_size."""
         img_dir = os.path.join(
             scene_path, "videos", "chunk-000",
             f"observation.images.rgb.{camera_key}"
@@ -194,17 +467,12 @@ class NavVideoDataset(torch.utils.data.Dataset):
         img_path = os.path.join(img_dir, f"episode_{episode_idx:06d}_{frame_idx}.jpg")
         img = Image.open(img_path).convert("RGB")
         img_tensor = transforms_F.to_tensor(img)  # [C, H, W] in [0, 1]
-        return img_tensor
-
-    def _load_and_resize_frame(self, scene_path: str, camera_key: str, episode_idx: int, frame_idx: int) -> torch.Tensor:
-        """Load and resize a single frame to target video_size."""
-        img = self._load_image(scene_path, camera_key, episode_idx, frame_idx)
-        img = transforms_F.resize(
-            img, self.video_size,
+        img_tensor = transforms_F.resize(
+            img_tensor, self.video_size,
             interpolation=transforms_F.InterpolationMode.BILINEAR,
             antialias=True,
         )
-        return img  # [C, H, W] in [0, 1]
+        return img_tensor
 
     def _load_poses(self, scene_path: str, episode_idx: int, camera_key: str) -> np.ndarray:
         """Load all poses for an episode. Returns [N, 4, 4] array."""
@@ -217,68 +485,79 @@ class NavVideoDataset(torch.utils.data.Dataset):
         poses = np.array([np.vstack(p) for p in poses_raw])  # [N, 4, 4]
         return poses
 
-    def _compute_relative_actions(
-        self, poses: np.ndarray, current_idx: int, num_steps: int
+    def _compute_spline_actions(
+        self, poses: np.ndarray, start_idx: int, end_idx: int
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Compute relative (x, y, theta) actions from current frame.
+        Compute action labels using InternNav-style cubic spline interpolation.
+
+        1. Extract poses from start_idx to end_idx
+        2. Convert to relative (x, y, yaw) w.r.t. start frame
+        3. Filter static points
+        4. Cubic spline interpolation
+        5. Equal-distance resample to predict_step_num points
 
         Returns:
-            actions: [num_steps, 3] relative (x, y, theta) waypoints.
-            is_pad: [num_steps] boolean mask (True = padded beyond trajectory end).
+            actions: [predict_step_num, 3] — (dx, dy, d_theta) per step.
+            is_pad: [predict_step_num] — True where padded (beyond trajectory).
         """
-        T_base = poses[current_idx]
-        T_base_inv = np.linalg.inv(T_base)
+        segment_poses = poses[start_idx:end_idx]
+        segment_len = len(segment_poses)
 
-        actions = np.zeros((num_steps, 3), dtype=np.float32)
-        is_pad = np.ones(num_steps, dtype=bool)
+        if segment_len < 2:
+            actions = np.zeros((self.predict_step_num, 3), dtype=np.float32)
+            is_pad = np.ones(self.predict_step_num, dtype=bool)
+            return actions, is_pad
 
-        for i in range(num_steps):
-            frame_j = current_idx + i + 1
-            if frame_j >= len(poses):
-                # Beyond trajectory end: repeat last valid relative pose (= stay)
-                if i > 0:
-                    actions[i] = actions[i - 1]
-                continue
+        # Convert to relative coordinates
+        discrete_traj = get_trajectory_relative_to_frame(segment_poses, camera_deg=self._camera_deg)
 
-            T_rel = T_base_inv @ poses[frame_j]
-            local_pos = T_rel[:3, 3]
-            R_rel = T_rel[:3, :3]
-            theta = np.arctan2(R_rel[0, 2], R_rel[2, 2])
+        # Interpolate and resample
+        _, resampled_actions = interpolate_and_resample_trajectory(discrete_traj, self.predict_step_num)
 
-            actions[i] = [local_pos[0], local_pos[2], theta]
-            is_pad[i] = False
+        # Clip or pad to exact predict_step_num
+        resampled_actions = clip_or_pad(resampled_actions, self.predict_step_num)
 
-        return actions, is_pad
+        # Determine padding: if the original segment is very short, tail might be repeated
+        # We mark as not-padded since the spline handles extension gracefully
+        is_pad = np.zeros(self.predict_step_num, dtype=bool)
 
-    def _get_history_indices(self, current_idx: int) -> List[int]:
+        # If segment is extremely short (< 3 real moving points), mark tail as padded
+        traj_xy = discrete_traj[:, :2]
+        steps = traj_xy[1:] - traj_xy[:-1]
+        n_moving = (np.sum(steps**2, axis=1) > 0.05).sum()
+        if n_moving < 2:
+            is_pad[1:] = True
+
+        return resampled_actions.astype(np.float32), is_pad
+
+    def _get_history_indices(self, start_frame_id: int) -> List[int]:
         """
-        Uniformly sample n_history_frames indices from [0, current_idx-1].
-        If trajectory is shorter than n_history_frames, repeat first frame.
+        Uniformly sample n_history_frames indices from [0, start_frame_id-1].
+        If not enough frames, pad by repeating.
         """
-        if current_idx <= 0:
+        if start_frame_id <= 0:
             return [0] * self.n_history_frames
 
-        if current_idx < self.n_history_frames:
-            # Not enough frames: sample what we have, pad with first frame
-            available = list(range(current_idx))
-            # Uniformly sample from available, then pad
-            indices = np.linspace(0, current_idx - 1, self.n_history_frames, dtype=int).tolist()
-        else:
-            # Uniformly sample 8 frames from [0, current_idx-1]
-            indices = np.linspace(0, current_idx - 1, self.n_history_frames, dtype=int).tolist()
-
+        indices = np.linspace(0, start_frame_id - 1, self.n_history_frames, dtype=int).tolist()
         return indices
 
-    def _get_future_indices(self, current_idx: int, episode_length: int) -> List[int]:
+    def _get_future_indices(self, start_frame_id: int, end_frame_id: int, episode_length: int) -> List[int]:
         """
-        Get n_future_video_frames indices after current, with stride to span 32 action steps.
-        If beyond episode end, clamp to last valid frame.
+        Get n_future_video_frames indices spanning from start_frame_id to end_frame_id.
+        Uses adaptive stride based on goal length.
         """
+        goal_len = end_frame_id - start_frame_id
+        if goal_len <= 0:
+            return [min(start_frame_id, episode_length - 1)] * self.n_future_video_frames
+
+        # Adaptive stride to span the goal segment with n_future_video_frames frames
+        stride = max(1, goal_len // self.n_future_video_frames)
+
         indices = []
         for i in range(1, self.n_future_video_frames + 1):
-            fidx = current_idx + i * self.future_frame_stride
-            fidx = min(fidx, episode_length - 1)  # clamp to trajectory end
+            fidx = start_frame_id + i * stride
+            fidx = min(fidx, episode_length - 1)
             indices.append(fidx)
         return indices
 
@@ -287,22 +566,22 @@ class NavVideoDataset(torch.utils.data.Dataset):
         sample_info = self.samples[idx]
         scene_path = sample_info["scene_path"]
         episode_idx = sample_info["episode_idx"]
-        current_idx = sample_info["current_idx"]
+        start_frame_id = sample_info["start_frame_id"]
+        end_frame_id = sample_info["end_frame_id"]
         episode_length = sample_info["episode_length"]
         instruction = sample_info["instruction"]
 
         # --- Frame indices ---
-        history_indices = self._get_history_indices(current_idx)  # [8]
-        future_indices = self._get_future_indices(current_idx, episode_length)  # [8]
+        history_indices = self._get_history_indices(start_frame_id)  # [8]
+        future_indices = self._get_future_indices(start_frame_id, end_frame_id, episode_length)  # [8]
         # All 0deg frame indices: history(8) + current(1) + future(8) = 17
-        all_0deg_indices = history_indices + [current_idx] + future_indices
+        all_0deg_indices = history_indices + [start_frame_id] + future_indices
 
         # --- Load 0deg video frames (17 frames) ---
         video_frames = []
         image_is_pad = []
         for fidx in all_0deg_indices:
             if fidx >= episode_length:
-                # Pad with last valid frame
                 if video_frames:
                     video_frames.append(video_frames[-1].clone())
                 else:
@@ -318,16 +597,15 @@ class NavVideoDataset(torch.utils.data.Dataset):
         video = video.permute(1, 0, 2, 3)  # [C, 17, H, W]
 
         # --- Load overhead frame (30deg at current timestep) ---
-        if current_idx < episode_length:
-            overhead = self._load_and_resize_frame(scene_path, self.overhead_camera, episode_idx, current_idx)
+        if start_frame_id < episode_length:
+            overhead = self._load_and_resize_frame(scene_path, self.overhead_camera, episode_idx, start_frame_id)
         else:
             overhead = torch.zeros(3, self.video_size[0], self.video_size[1])
         overhead = overhead * 2.0 - 1.0  # [0,1] → [-1,1]
-        # overhead shape: [C, H, W]
 
-        # --- Actions (32 steps from current frame) ---
-        poses = self._load_poses(scene_path, episode_idx, self.primary_camera)
-        actions, action_is_pad = self._compute_relative_actions(poses, current_idx, self.num_action_steps)
+        # --- Actions: cubic spline interpolation + resampling ---
+        poses = self._load_poses(scene_path, episode_idx, self.overhead_camera)
+        actions, action_is_pad = self._compute_spline_actions(poses, start_frame_id, end_frame_id)
 
         # --- Text context ---
         prompt = DEFAULT_PROMPT.format(task=instruction)
@@ -335,19 +613,19 @@ class NavVideoDataset(torch.utils.data.Dataset):
         context[~context_mask] = 0.0
         context_mask = torch.ones_like(context_mask)
 
-        # --- Tensors ---
-        # Append moving flag as 4th dimension: 1.0=moving, 0.0=stopped (reached goal)
-        moving_flag = (~action_is_pad).astype(np.float32).reshape(-1, 1)  # [32, 1]
-        actions_with_flag = np.concatenate([actions, moving_flag], axis=1)  # [32, 4]
-        action_tensor = torch.from_numpy(actions_with_flag).float()  # [32, 4]
-        action_is_pad_tensor = torch.from_numpy(action_is_pad).bool()  # [32]
-        image_is_pad_tensor = torch.tensor(image_is_pad, dtype=torch.bool)  # [17]
+        # --- Assemble output tensors ---
+        # Append moving flag: 1.0 = moving, 0.0 = stopped
+        moving_flag = (~action_is_pad).astype(np.float32).reshape(-1, 1)
+        actions_with_flag = np.concatenate([actions, moving_flag], axis=1)  # [predict_step_num, 4]
+        action_tensor = torch.from_numpy(actions_with_flag).float()
+        action_is_pad_tensor = torch.from_numpy(action_is_pad).bool()
+        image_is_pad_tensor = torch.tensor(image_is_pad, dtype=torch.bool)
 
         data = {
             "video": video,                         # [C, 17, H, W]
             "overhead": overhead,                   # [C, H, W]
-            "action": action_tensor,                # [32, 4]
-            "action_is_pad": action_is_pad_tensor,  # [32]
+            "action": action_tensor,                # [predict_step_num, 4]
+            "action_is_pad": action_is_pad_tensor,  # [predict_step_num]
             "context": context,                     # [context_len, 4096]
             "context_mask": context_mask,            # [context_len]
             "image_is_pad": image_is_pad_tensor,    # [17]
