@@ -1,36 +1,34 @@
 """
-Navigation Video Dataset for FastWAM (Multi-Frame History + Overhead Conditioning).
+Navigation Video Dataset for FastWAM.
 
 Reads VLN trajectory data in LeRobot format (parquet + jpg images) and produces
 samples compatible with the FastWAM training pipeline.
 
 Architecture:
   - 9 condition frames (125cm_0deg): 8 uniformly sampled history + current frame
-  - 8 future frames (125cm_0deg): for video generation training
+  - 8 future frames (125cm_0deg): stride=2 over 16-frame action horizon
   - Total 0deg video: 17 frames (T%4==1 ✓) → 5 VAE latent frames
-  - Action: predict_step_num relative waypoints (cubic spline resampled)
+  - Action: predict_step_num waypoints from cubic spline resampling of 16-frame segment
+
+Video and action are aligned:
+  - Action horizon = 16 frames from current frame
+  - Video future = 8 frames at stride 2, covering the same 16-frame span
+  - Near trajectory end, both video and action use shorter remaining trajectory
 
 Each sample contains:
   - video: [C, 17, H, W] — 0deg single-camera RGB video (9 cond + 8 future)
-  - action: [predict_step_num, action_dim] — relative (x, y, theta, moving_flag) trajectory
+  - action: [predict_step_num, 4] — relative (dx, dy, d_theta, moving_flag)
   - action_is_pad: [predict_step_num] — padding mask for action
   - context: [context_len, text_dim] — cached T5 text embedding
   - context_mask: [context_len] — text mask
   - image_is_pad: [17] — video frame padding mask
   - n_cond_frames: int — number of condition frames (9)
-
-Sampling strategy (aligned with InternNav):
-  - Start frames are sampled with stride `sample_step` within each episode
-  - End frames are determined by pre-annotated `pixel_goals` (relative_goal_frame_id)
-  - Trajectories between start and end are smoothed via cubic spline interpolation
-    and resampled to fixed `predict_step_num` waypoints at equal distance intervals
 """
 
 import hashlib
 import json
 import os
 import traceback
-from pathlib import Path
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -48,7 +46,7 @@ DEFAULT_PROMPT = "A video recorded from a navigation agent's point of view execu
 
 
 # =============================================================================
-# Trajectory processing utilities (aligned with InternNav)
+# Trajectory processing utilities
 # =============================================================================
 
 
@@ -164,21 +162,12 @@ def smooth_and_resample_trajectory(points: np.ndarray, sample_length: int = 33, 
 
 
 def xy_to_delta_xyt(xy_actions: np.ndarray) -> np.ndarray:
-    """
-    Convert absolute (x, y) positions to relative (dx, dy, delta_yaw).
-
-    Args:
-        xy_actions: (N, 2) array of absolute positions.
-
-    Returns:
-        delta_xyt: (N-1, 3) array of (dx, dy, delta_yaw).
-    """
+    """Convert absolute (x, y) positions to relative (dx, dy, delta_yaw)."""
     vectors = np.diff(xy_actions, axis=0)
     yaw = np.arctan2(vectors[:, 1], vectors[:, 0])
 
     delta_yaw = np.diff(yaw)
     delta_yaw = (delta_yaw + np.pi) % (2 * np.pi) - np.pi
-
     delta_yaw = np.concatenate([[yaw[0]], delta_yaw])
 
     delta_xyt = np.concatenate([vectors, delta_yaw[:, None]], axis=1)
@@ -234,35 +223,37 @@ def clip_or_pad(arr: np.ndarray, fixed_len: int) -> np.ndarray:
 
 class NavVideoDataset(torch.utils.data.Dataset):
     """
-    Dataset for VLN navigation trajectories with multi-frame history + overhead conditioning.
+    Navigation video dataset with aligned video and action horizons.
 
-    Uses InternNav-style sampling:
-    - Start frames at fixed stride (sample_step)
-    - End frames determined by pixel_goals annotations
-    - Action labels generated via cubic spline interpolation + equal-distance resampling
+    Design:
+      - Action horizon: 16 frames from current frame (or less near trajectory end)
+      - Video future: 8 frames at stride 2, covering the same 16-frame span
+      - Action labels: cubic spline interpolation on the 16-frame segment, resampled
+        to predict_step_num waypoints
+      - Near trajectory end: shorter action/video horizon (terminal oversampling)
 
     Args:
         dataset_dirs: List of scene root directories.
-        camera_keys: [primary_camera, overhead_camera], e.g. ["125cm_0deg", "125cm_30deg"].
-        num_frames: Total trajectory steps spanned per sample (used for video frame count).
-        n_history_frames: Number of past frames to include as condition (default 8).
-        n_future_video_frames: Number of future frames for video generation (default 8).
-        video_size: [H, W] for each single-camera frame.
+        camera_keys: [primary_camera, overhead_camera].
+        num_frames: Action horizon in raw frames (default 16).
+        n_history_frames: Number of past frames as condition (default 8).
+        n_future_video_frames: Number of future video frames (default 8).
+        video_size: [H, W] for each frame.
         text_embedding_cache_dir: Path to pre-computed text embeddings.
         context_len: Text context length.
         sample_stride: Stride for sampling start frames within episodes.
-        terminal_oversample_ratio: How much more to sample near trajectory end.
-        predict_step_num: Number of action waypoints to predict (after resampling).
+        terminal_oversample_ratio: Extra sampling ratio near trajectory end.
+        predict_step_num: Number of action waypoints output (after spline resampling).
     """
 
     def __init__(
         self,
         dataset_dirs: List[str],
         camera_keys: List[str] = None,
-        num_frames: int = 33,
+        num_frames: int = 16,
         n_history_frames: int = 8,
         n_future_video_frames: int = 8,
-        action_video_freq_ratio: int = 4,
+        action_video_freq_ratio: int = 2,
         video_size: List[int] = None,
         concat_multi_camera: str = "none",
         text_embedding_cache_dir: Optional[str] = None,
@@ -279,13 +270,13 @@ class NavVideoDataset(torch.utils.data.Dataset):
         if video_size is None:
             video_size = [224, 224]
 
-        self.primary_camera = camera_keys[0]  # 125cm_0deg
+        self.primary_camera = camera_keys[0]
         self.overhead_camera = camera_keys[1] if len(camera_keys) > 1 else camera_keys[0]
         self.camera_keys = camera_keys
-        self.num_frames = num_frames
-        self.n_history_frames = n_history_frames
-        self.n_future_video_frames = n_future_video_frames
-        self.action_video_freq_ratio = action_video_freq_ratio
+        self.action_horizon = num_frames  # 16 raw frames for action
+        self.n_history_frames = n_history_frames  # 8
+        self.n_future_video_frames = n_future_video_frames  # 8
+        self.action_video_freq_ratio = action_video_freq_ratio  # 2: stride for video
         self.video_size = video_size
         self.text_embedding_cache_dir = text_embedding_cache_dir
         self.context_len = context_len
@@ -298,27 +289,26 @@ class NavVideoDataset(torch.utils.data.Dataset):
         self.action_dim = 4
         self.num_action_steps = predict_step_num
 
-        # Total video frames: history + current + future = 9 + 8 = 17
+        # Video layout: history + current + future = 9 + 8 = 17
         self.n_cond_frames = n_history_frames + 1  # 9
         self.total_video_frames = self.n_cond_frames + n_future_video_frames  # 17
         assert self.total_video_frames % 4 == 1, (
             f"Total video frames must satisfy T%4==1 for VAE, got {self.total_video_frames}"
         )
 
-        # Future frame stride: fixed stride between consecutive future video frames
-        self.future_frame_stride = 1
+        # Future video stride: 16 frames / 8 video frames = stride 2
+        self.future_frame_stride = action_video_freq_ratio  # 2
 
-        # Camera pitch for coordinate transform (extract from camera key)
+        # Camera pitch for coordinate transform
         self._camera_deg = self._parse_camera_deg(self.overhead_camera)
 
         # Build index
         self.samples = []
         self._build_index(dataset_dirs)
         logger.info(
-            f"NavVideoDataset: {len(self.samples)} samples from {len(dataset_dirs)} dataset dirs, "
-            f"primary_cam={self.primary_camera}, overhead_cam={self.overhead_camera}, "
-            f"n_history={n_history_frames}, n_future_video={n_future_video_frames}, "
-            f"total_video_frames={self.total_video_frames}, predict_step_num={predict_step_num}"
+            f"NavVideoDataset: {len(self.samples)} samples, "
+            f"action_horizon={self.action_horizon}, future_stride={self.future_frame_stride}, "
+            f"predict_step_num={predict_step_num}, n_future_video={n_future_video_frames}"
         )
 
     @staticmethod
@@ -334,10 +324,7 @@ class NavVideoDataset(torch.utils.data.Dataset):
 
     def _build_index(self, dataset_dirs: List[str]):
         """
-        Scan all scenes and episodes to build sample index (fast, only reads jsonl).
-
-        Pixel_goal filtering is deferred to __getitem__ time to avoid reading
-        ~79k parquet files at startup (which would take hours on cephfs).
+        Build sample index (fast, only reads jsonl metadata).
         """
         for dataset_dir in dataset_dirs:
             if not os.path.isdir(dataset_dir):
@@ -368,16 +355,15 @@ class NavVideoDataset(torch.utils.data.Dataset):
                     tasks = ep_info.get("tasks", [])
                     instruction = tasks[0] if tasks else ""
 
-                    if ep_length < self.n_history_frames + self.min_goal_len:
+                    if ep_length < self.n_history_frames + 2:
                         continue
 
-                    # Sample start frames with stride (no parquet IO here)
+                    # Regular samples with stride
                     num_rounds = ep_length // self.sample_stride
                     for n in range(num_rounds + 1):
                         start_frame_id = n * self.sample_stride
                         if start_frame_id >= ep_length - 1:
                             continue
-
                         self.samples.append({
                             "scene_path": scene_path,
                             "episode_idx": ep_idx,
@@ -386,7 +372,7 @@ class NavVideoDataset(torch.utils.data.Dataset):
                             "instruction": instruction,
                         })
 
-                    # Terminal oversampling: STOP samples near trajectory end
+                    # Terminal oversampling: near-end samples get shorter trajectories
                     terminal_start = max(0, ep_length - 5)
                     for current_idx in range(terminal_start, ep_length):
                         n_extra = int(self.terminal_oversample_ratio)
@@ -412,7 +398,7 @@ class NavVideoDataset(torch.utils.data.Dataset):
         )
         img_path = os.path.join(img_dir, f"episode_{episode_idx:06d}_{frame_idx}.jpg")
         img = Image.open(img_path).convert("RGB")
-        img_tensor = transforms_F.to_tensor(img)  # [C, H, W] in [0, 1]
+        img_tensor = transforms_F.to_tensor(img)
         img_tensor = transforms_F.resize(
             img_tensor, self.video_size,
             interpolation=transforms_F.InterpolationMode.BILINEAR,
@@ -428,24 +414,21 @@ class NavVideoDataset(torch.utils.data.Dataset):
         )
         df = pd.read_parquet(parquet_path, columns=[f"pose.{camera_key}"])
         poses_raw = df[f"pose.{camera_key}"].tolist()
-        poses = np.array([np.vstack(p) for p in poses_raw])  # [N, 4, 4]
+        poses = np.array([np.vstack(p) for p in poses_raw])
         return poses
 
     def _compute_spline_actions(
         self, poses: np.ndarray, start_idx: int, end_idx: int
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Compute action labels using InternNav-style cubic spline interpolation.
+        Compute action labels using cubic spline interpolation.
 
-        1. Extract poses from start_idx to end_idx
-        2. Convert to relative (x, y, yaw) w.r.t. start frame
-        3. Filter static points
-        4. Cubic spline interpolation
-        5. Equal-distance resample to predict_step_num points
+        Takes poses[start_idx:end_idx], converts to relative coords,
+        filters static points, applies cubic spline, resamples to predict_step_num.
 
         Returns:
             actions: [predict_step_num, 3] — (dx, dy, d_theta) per step.
-            is_pad: [predict_step_num] — True where padded (beyond trajectory).
+            is_pad: [predict_step_num] — True where padded.
         """
         segment_poses = poses[start_idx:end_idx]
         segment_len = len(segment_poses)
@@ -455,20 +438,13 @@ class NavVideoDataset(torch.utils.data.Dataset):
             is_pad = np.ones(self.predict_step_num, dtype=bool)
             return actions, is_pad
 
-        # Convert to relative coordinates
         discrete_traj = get_trajectory_relative_to_frame(segment_poses, camera_deg=self._camera_deg)
 
-        # Interpolate and resample
         _, resampled_actions = interpolate_and_resample_trajectory(discrete_traj, self.predict_step_num)
-
-        # Clip or pad to exact predict_step_num
         resampled_actions = clip_or_pad(resampled_actions, self.predict_step_num)
 
-        # Determine padding: if the original segment is very short, tail might be repeated
-        # We mark as not-padded since the spline handles extension gracefully
         is_pad = np.zeros(self.predict_step_num, dtype=bool)
 
-        # If segment is extremely short (< 3 real moving points), mark tail as padded
         traj_xy = discrete_traj[:, :2]
         steps = traj_xy[1:] - traj_xy[:-1]
         n_moving = (np.sum(steps**2, axis=1) > 0.05).sum()
@@ -478,24 +454,16 @@ class NavVideoDataset(torch.utils.data.Dataset):
         return resampled_actions.astype(np.float32), is_pad
 
     def _get_history_indices(self, start_frame_id: int) -> List[int]:
-        """
-        Uniformly sample n_history_frames indices from [0, start_frame_id-1].
-        If not enough frames, pad by repeating.
-        """
+        """Uniformly sample n_history_frames indices from [0, start_frame_id-1]."""
         if start_frame_id <= 0:
             return [0] * self.n_history_frames
-
         indices = np.linspace(0, start_frame_id - 1, self.n_history_frames, dtype=int).tolist()
         return indices
 
-    def _get_future_indices(self, start_frame_id: int, episode_length: int) -> List[int]:
+    def _get_future_indices(self, start_frame_id: int, end_frame_id: int, episode_length: int) -> List[int]:
         """
-        Get n_future_video_frames indices after start_frame_id with FIXED stride.
-
-        Uses self.future_frame_stride (default 4) to maintain consistent temporal spacing
-        for VAE encoding quality. Video frames and action steps are in different parametric
-        spaces (time vs distance) — this is acceptable since the action DiT and video DiT
-        are independent (action_conditioned=false).
+        Get n_future_video_frames indices covering the action horizon with stride 2.
+        Aligned with action: both cover start+1 to start+16 (or shorter near end).
         """
         indices = []
         for i in range(1, self.n_future_video_frames + 1):
@@ -503,27 +471,6 @@ class NavVideoDataset(torch.utils.data.Dataset):
             fidx = min(fidx, episode_length - 1)
             indices.append(fidx)
         return indices
-
-    def _resolve_end_frame(self, scene_path: str, episode_idx: int, start_frame_id: int, episode_length: int) -> int:
-        """
-        Read pixel_goal from parquet to determine the end frame for this sample.
-        Falls back to a fixed horizon if pixel_goal is unavailable or invalid.
-        """
-        parquet_path = os.path.join(
-            scene_path, "data", "chunk-000",
-            f"episode_{episode_idx:06d}.parquet"
-        )
-        goal_col = f"relative_goal_frame_id.{self.overhead_camera}"
-        try:
-            df = pd.read_parquet(parquet_path, columns=[goal_col])
-            if goal_col in df.columns:
-                goal_len = int(df[goal_col].iloc[start_frame_id])
-                if goal_len >= self.min_goal_len:
-                    return min(start_frame_id + goal_len + 1, episode_length)
-        except Exception:
-            pass
-        # Fallback: use remaining trajectory or fixed 32-step horizon
-        return min(start_frame_id + self.predict_step_num + 1, episode_length)
 
     def _get(self, idx: int) -> dict:
         """Get a single sample."""
@@ -534,16 +481,16 @@ class NavVideoDataset(torch.utils.data.Dataset):
         episode_length = sample_info["episode_length"]
         instruction = sample_info["instruction"]
 
-        # Resolve end_frame_id by reading pixel_goal from parquet (deferred IO)
-        end_frame_id = self._resolve_end_frame(scene_path, episode_idx, start_frame_id, episode_length)
+        # Action end frame: start + 16, clamped to episode end
+        # Near terminal, this naturally becomes shorter
+        end_frame_id = min(start_frame_id + self.action_horizon + 1, episode_length)
 
         # --- Frame indices ---
         history_indices = self._get_history_indices(start_frame_id)  # [8]
-        future_indices = self._get_future_indices(start_frame_id, episode_length)  # [8]
-        # All 0deg frame indices: history(8) + current(1) + future(8) = 17
-        all_0deg_indices = history_indices + [start_frame_id] + future_indices
+        future_indices = self._get_future_indices(start_frame_id, end_frame_id, episode_length)  # [8]
+        all_0deg_indices = history_indices + [start_frame_id] + future_indices  # 17
 
-        # --- Load 0deg video frames (17 frames) ---
+        # --- Load video frames (17 frames) ---
         video_frames = []
         image_is_pad = []
         for fidx in all_0deg_indices:
@@ -562,7 +509,7 @@ class NavVideoDataset(torch.utils.data.Dataset):
         video = video * 2.0 - 1.0  # [0,1] → [-1,1]
         video = video.permute(1, 0, 2, 3)  # [C, 17, H, W]
 
-        # --- Actions: cubic spline interpolation + resampling ---
+        # --- Actions: cubic spline on 16-frame segment ---
         poses = self._load_poses(scene_path, episode_idx, self.overhead_camera)
         actions, action_is_pad = self._compute_spline_actions(poses, start_frame_id, end_frame_id)
 
@@ -572,8 +519,7 @@ class NavVideoDataset(torch.utils.data.Dataset):
         context[~context_mask] = 0.0
         context_mask = torch.ones_like(context_mask)
 
-        # --- Assemble output tensors ---
-        # Append moving flag: 1.0 = moving, 0.0 = stopped
+        # --- Assemble output ---
         moving_flag = (~action_is_pad).astype(np.float32).reshape(-1, 1)
         actions_with_flag = np.concatenate([actions, moving_flag], axis=1)  # [predict_step_num, 4]
         action_tensor = torch.from_numpy(actions_with_flag).float()
@@ -611,8 +557,8 @@ class NavVideoDataset(torch.utils.data.Dataset):
             context_mask = torch.ones(self.context_len, dtype=torch.bool)
             return context, context_mask
         payload = torch.load(cache_path, map_location="cpu")
-        context = payload["context"]  # [context_len, text_dim]
-        context_mask = payload["mask"].bool()  # [context_len]
+        context = payload["context"]
+        context_mask = payload["mask"].bool()
         return context, context_mask
 
     def __getitem__(self, idx):

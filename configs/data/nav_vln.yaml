@@ -5,15 +5,15 @@ train:
     - /apdcephfs_gy6/share_303214315/jishengpeng/vlndata/InternData-N1/vln_ce/traj_data/rxr
     - /apdcephfs_gy6/share_303214315/jishengpeng/vlndata/InternData-N1/vln_ce/traj_data/scalevln
   camera_keys: ["125cm_0deg", "125cm_30deg"]
-  num_frames: 33
+  num_frames: 16
   n_history_frames: 8
   n_future_video_frames: 8
-  action_video_freq_ratio: 4
+  action_video_freq_ratio: 2
   video_size: [224, 224]
   concat_multi_camera: "none"
   text_embedding_cache_dir: /apdcephfs_qy2/share_303214315/hunyuan/xxd/FastWAM/text_embeds_cache/nav_vln
   context_len: 256
   sample_stride: 4
   terminal_oversample_ratio: 3.0
-  predict_step_num: 32
+  predict_step_num: 16
   min_goal_len: 3
