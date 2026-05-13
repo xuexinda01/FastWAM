@@ -542,21 +542,18 @@ class NavVideoDataset(torch.utils.data.Dataset):
         indices = np.linspace(0, start_frame_id - 1, self.n_history_frames, dtype=int).tolist()
         return indices
 
-    def _get_future_indices(self, start_frame_id: int, end_frame_id: int, episode_length: int) -> List[int]:
+    def _get_future_indices(self, start_frame_id: int, episode_length: int) -> List[int]:
         """
-        Get n_future_video_frames indices spanning from start_frame_id to end_frame_id.
-        Uses adaptive stride based on goal length.
+        Get n_future_video_frames indices after start_frame_id with FIXED stride.
+
+        Uses self.future_frame_stride (default 4) to maintain consistent temporal spacing
+        for VAE encoding quality. Video frames and action steps are in different parametric
+        spaces (time vs distance) — this is acceptable since the action DiT and video DiT
+        are independent (action_conditioned=false).
         """
-        goal_len = end_frame_id - start_frame_id
-        if goal_len <= 0:
-            return [min(start_frame_id, episode_length - 1)] * self.n_future_video_frames
-
-        # Adaptive stride to span the goal segment with n_future_video_frames frames
-        stride = max(1, goal_len // self.n_future_video_frames)
-
         indices = []
         for i in range(1, self.n_future_video_frames + 1):
-            fidx = start_frame_id + i * stride
+            fidx = start_frame_id + i * self.future_frame_stride
             fidx = min(fidx, episode_length - 1)
             indices.append(fidx)
         return indices
@@ -573,7 +570,7 @@ class NavVideoDataset(torch.utils.data.Dataset):
 
         # --- Frame indices ---
         history_indices = self._get_history_indices(start_frame_id)  # [8]
-        future_indices = self._get_future_indices(start_frame_id, end_frame_id, episode_length)  # [8]
+        future_indices = self._get_future_indices(start_frame_id, episode_length)  # [8]
         # All 0deg frame indices: history(8) + current(1) + future(8) = 17
         all_0deg_indices = history_indices + [start_frame_id] + future_indices
 
