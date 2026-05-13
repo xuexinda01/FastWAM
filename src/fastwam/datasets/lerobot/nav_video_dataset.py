@@ -334,16 +334,11 @@ class NavVideoDataset(torch.utils.data.Dataset):
 
     def _build_index(self, dataset_dirs: List[str]):
         """
-        Scan all scenes and episodes to build sample index using pixel_goals.
+        Scan all scenes and episodes to build sample index (fast, only reads jsonl).
 
-        For each episode, sample start frames at stride `sample_stride`. For each start frame,
-        check if a valid pixel_goal exists (goal_len >= min_goal_len). If so, record the sample
-        with the goal-determined endpoint.
+        Pixel_goal filtering is deferred to __getitem__ time to avoid reading
+        ~79k parquet files at startup (which would take hours on cephfs).
         """
-        n_skipped_no_goal = 0
-        n_skipped_short = 0
-        n_skipped_no_columns = 0
-
         for dataset_dir in dataset_dirs:
             if not os.path.isdir(dataset_dir):
                 logger.warning(f"Dataset dir not found: {dataset_dir}")
@@ -376,64 +371,22 @@ class NavVideoDataset(torch.utils.data.Dataset):
                     if ep_length < self.n_history_frames + self.min_goal_len:
                         continue
 
-                    # Load parquet to get pixel_goals and actions
-                    parquet_path = os.path.join(
-                        scene_path, "data", "chunk-000",
-                        f"episode_{ep_idx:06d}.parquet"
-                    )
-                    if not os.path.isfile(parquet_path):
-                        continue
-
-                    try:
-                        goal_col = f"relative_goal_frame_id.{self.overhead_camera}"
-                        action_col = "action"
-                        df = pd.read_parquet(parquet_path, columns=[goal_col, action_col])
-                    except Exception:
-                        # Columns might not exist in this parquet
-                        n_skipped_no_columns += 1
-                        continue
-
-                    if goal_col not in df.columns:
-                        n_skipped_no_columns += 1
-                        continue
-
-                    pixel_goal_frame_ids = df[goal_col].tolist()
-                    actions = df[action_col].tolist()
-                    # Shift actions: actions[i] = actions[i+1] in InternNav convention
-                    actions = actions[1:] + [0]
-
-                    # Sample start frames with stride
+                    # Sample start frames with stride (no parquet IO here)
                     num_rounds = ep_length // self.sample_stride
                     for n in range(num_rounds + 1):
                         start_frame_id = n * self.sample_stride
                         if start_frame_id >= ep_length - 1:
                             continue
 
-                        goal_len = int(pixel_goal_frame_ids[start_frame_id])
-
-                        # Skip frames without a visible goal
-                        if goal_len == -1:
-                            n_skipped_no_goal += 1
-                            continue
-
-                        # Skip too-short goals
-                        if goal_len < self.min_goal_len:
-                            n_skipped_short += 1
-                            continue
-
-                        end_frame_id = start_frame_id + goal_len + 1
-                        end_frame_id = min(end_frame_id, ep_length)
-
                         self.samples.append({
                             "scene_path": scene_path,
                             "episode_idx": ep_idx,
                             "start_frame_id": start_frame_id,
-                            "end_frame_id": end_frame_id,
                             "episode_length": ep_length,
                             "instruction": instruction,
                         })
 
-                    # Terminal oversampling: add STOP samples near trajectory end
+                    # Terminal oversampling: STOP samples near trajectory end
                     terminal_start = max(0, ep_length - 5)
                     for current_idx in range(terminal_start, ep_length):
                         n_extra = int(self.terminal_oversample_ratio)
@@ -442,16 +395,11 @@ class NavVideoDataset(torch.utils.data.Dataset):
                                 "scene_path": scene_path,
                                 "episode_idx": ep_idx,
                                 "start_frame_id": current_idx,
-                                "end_frame_id": ep_length,  # at the end = STOP
                                 "episode_length": ep_length,
                                 "instruction": instruction,
                             })
 
-        logger.info(
-            f"Index built: {len(self.samples)} samples. "
-            f"Skipped: no_goal={n_skipped_no_goal}, short={n_skipped_short}, "
-            f"no_columns={n_skipped_no_columns}"
-        )
+        logger.info(f"Index built: {len(self.samples)} samples from {len(dataset_dirs)} dataset dirs.")
 
     def __len__(self):
         return len(self.samples)
@@ -556,15 +504,38 @@ class NavVideoDataset(torch.utils.data.Dataset):
             indices.append(fidx)
         return indices
 
+    def _resolve_end_frame(self, scene_path: str, episode_idx: int, start_frame_id: int, episode_length: int) -> int:
+        """
+        Read pixel_goal from parquet to determine the end frame for this sample.
+        Falls back to a fixed horizon if pixel_goal is unavailable or invalid.
+        """
+        parquet_path = os.path.join(
+            scene_path, "data", "chunk-000",
+            f"episode_{episode_idx:06d}.parquet"
+        )
+        goal_col = f"relative_goal_frame_id.{self.overhead_camera}"
+        try:
+            df = pd.read_parquet(parquet_path, columns=[goal_col])
+            if goal_col in df.columns:
+                goal_len = int(df[goal_col].iloc[start_frame_id])
+                if goal_len >= self.min_goal_len:
+                    return min(start_frame_id + goal_len + 1, episode_length)
+        except Exception:
+            pass
+        # Fallback: use remaining trajectory or fixed 32-step horizon
+        return min(start_frame_id + self.predict_step_num + 1, episode_length)
+
     def _get(self, idx: int) -> dict:
         """Get a single sample."""
         sample_info = self.samples[idx]
         scene_path = sample_info["scene_path"]
         episode_idx = sample_info["episode_idx"]
         start_frame_id = sample_info["start_frame_id"]
-        end_frame_id = sample_info["end_frame_id"]
         episode_length = sample_info["episode_length"]
         instruction = sample_info["instruction"]
+
+        # Resolve end_frame_id by reading pixel_goal from parquet (deferred IO)
+        end_frame_id = self._resolve_end_frame(scene_path, episode_idx, start_frame_id, episode_length)
 
         # --- Frame indices ---
         history_indices = self._get_history_indices(start_frame_id)  # [8]
@@ -590,7 +561,6 @@ class NavVideoDataset(torch.utils.data.Dataset):
         video = torch.stack(video_frames, dim=0)  # [17, C, H, W]
         video = video * 2.0 - 1.0  # [0,1] → [-1,1]
         video = video.permute(1, 0, 2, 3)  # [C, 17, H, W]
-
 
         # --- Actions: cubic spline interpolation + resampling ---
         poses = self._load_poses(scene_path, episode_idx, self.overhead_camera)
