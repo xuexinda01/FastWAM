@@ -364,9 +364,8 @@ class WanVideoDiT(torch.nn.Module):
         assert require_clip_embedding == False
         assert require_vae_embedding == False and fuse_vae_embedding_in_latents == True, "Only support fusing vae embedding in latents"
 
-        # Support overhead channel concat: input is in_dim (video) + in_dim (overhead) = 2*in_dim
-        self.overhead_conditioning = True  # enable overhead channel concat
-        patch_input_dim = in_dim * 2 if self.overhead_conditioning else in_dim
+        self.overhead_conditioning = False
+        patch_input_dim = in_dim
         self.patch_embedding = nn.Conv3d(
             patch_input_dim, hidden_dim, kernel_size=patch_size, stride=patch_size)
         self.text_embedding = nn.Sequential(
@@ -402,24 +401,8 @@ class WanVideoDiT(torch.nn.Module):
             logger.info("Using gradient checkpointing for DiT blocks. This will save memory but use more computation.")
 
     def initialize_overhead_channels_from_pretrained(self, pretrained_state_dict: dict):
-        """
-        Initialize patch_embedding when loading from a pretrained model that had
-        in_dim channels (no overhead). Copy the original weights to the first in_dim
-        channels and zero-init the overhead channels (in_dim:2*in_dim).
-        This ensures the model starts from its pretrained behavior.
-        """
-        key = "patch_embedding.weight"
-        if key in pretrained_state_dict:
-            old_weight = pretrained_state_dict[key]  # [hidden_dim, in_dim, pt, ph, pw]
-            new_weight = self.patch_embedding.weight.data  # [hidden_dim, 2*in_dim, pt, ph, pw]
-            if old_weight.shape[1] * 2 == new_weight.shape[1]:
-                new_weight[:, :old_weight.shape[1]] = old_weight
-                new_weight[:, old_weight.shape[1]:] = 0.0
-                self.patch_embedding.weight.data = new_weight
-                logger.info(
-                    f"Initialized patch_embedding: copied {old_weight.shape[1]} channels "
-                    f"from pretrained, zero-init overhead channels {old_weight.shape[1]}:{new_weight.shape[1]}"
-                )
+        """No-op: overhead conditioning is disabled."""
+        pass
             
 
     def patchify(self, x: torch.Tensor, control_camera_latents_input: Optional[torch.Tensor] = None):

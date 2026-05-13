@@ -159,24 +159,6 @@ class FastWAM(torch.nn.Module):
 
         video_expert = components.dit
 
-        # Initialize overhead channels in patch_embedding from pretrained weights
-        # The loader skips patch_embedding due to shape mismatch (48→96 channels).
-        # We need to: copy pretrained 48ch weights to first 48ch, zero-init channels 48-95.
-        if hasattr(video_expert, 'overhead_conditioning') and video_expert.overhead_conditioning:
-            mismatched = getattr(video_expert, '_pretrained_mismatched_weights', {})
-            pretrained_patch_weight = mismatched.get("patch_embedding.weight", None)
-            if pretrained_patch_weight is not None:
-                video_expert.initialize_overhead_channels_from_pretrained(
-                    {"patch_embedding.weight": pretrained_patch_weight}
-                )
-            else:
-                # If no pretrained weight available, zero-init overhead half
-                with torch.no_grad():
-                    in_dim = video_expert.in_dim
-                    video_expert.patch_embedding.weight.data[:, in_dim:] = 0.0
-                    logger.info(
-                        f"Zero-initialized overhead channels ({in_dim}:{in_dim*2}) in patch_embedding."
-                    )
         action_expert = ActionDiT.from_pretrained(
             action_dit_config=action_dit_config,
             action_dit_pretrained_path=action_dit_pretrained_path,
@@ -428,16 +410,7 @@ class FastWAM(torch.nn.Module):
         # Extract condition latents (frozen during diffusion)
         condition_latents = input_latents[:, :, :n_cond_latent_frames].clone()
 
-        # --- Overhead frame encoding ---
         overhead_latent = None
-        if "overhead" in sample:
-            overhead = sample["overhead"]  # [B, C, H, W]
-            if overhead.ndim == 3:
-                overhead = overhead.unsqueeze(0)  # add batch dim
-            overhead = overhead.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
-            # Encode as single frame: [B, C, 1, H, W]
-            overhead_video = overhead.unsqueeze(2)  # [B, 3, 1, H, W]
-            overhead_latent = self._encode_video_latents(overhead_video, tiled=tiled)  # [B, z_dim, 1, H', W']
 
         fuse_flag = False
         if getattr(self.video_expert, "fuse_vae_embedding_in_latents", False):
@@ -573,15 +546,7 @@ class FastWAM(torch.nn.Module):
         # Freeze ALL condition latent frames (not just first frame)
         latents[:, :, :n_cond_latent_frames] = condition_latents
 
-        # --- Overhead channel concat ---
-        # Broadcast overhead latent to full temporal extent and concat along channel dim
-        if overhead_latent is not None:
-            T_lat = latents.shape[2]
-            overhead_broadcast = overhead_latent.expand(-1, -1, T_lat, -1, -1)  # [B, z_dim, T_lat, H', W']
-            latents_with_overhead = torch.cat([latents, overhead_broadcast], dim=1)  # [B, 2*z_dim, T_lat, H', W']
-        else:
-            # Fallback: pad with zeros if no overhead (backward compatibility)
-            latents_with_overhead = torch.cat([latents, torch.zeros_like(latents)], dim=1)
+        latents_with_overhead = latents
 
         noise_action = torch.randn_like(action)
         timestep_action = self.train_action_scheduler.sample_training_t(
@@ -709,16 +674,7 @@ class FastWAM(torch.nn.Module):
         gt_action: Optional[torch.Tensor] = None,
         overhead_latent: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Concat overhead if model expects it
-        if getattr(self.video_expert, 'overhead_conditioning', False):
-            T_lat = latents_video.shape[2]
-            if overhead_latent is not None:
-                overhead_broadcast = overhead_latent.expand(-1, -1, T_lat, -1, -1)
-            else:
-                overhead_broadcast = torch.zeros_like(latents_video)
-            latents_video_input = torch.cat([latents_video, overhead_broadcast], dim=1)
-        else:
-            latents_video_input = latents_video
+        latents_video_input = latents_video
 
         video_pre = self.video_expert.pre_dit(
             x=latents_video_input,
@@ -784,16 +740,7 @@ class FastWAM(torch.nn.Module):
         fuse_vae_embedding_in_latents: bool,
         overhead_latent: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # Concat overhead if model expects it
-        if getattr(self.video_expert, 'overhead_conditioning', False):
-            T_lat = first_frame_latents.shape[2]
-            if overhead_latent is not None:
-                overhead_broadcast = overhead_latent.expand(-1, -1, T_lat, -1, -1)
-            else:
-                overhead_broadcast = torch.zeros_like(first_frame_latents)
-            first_frame_input = torch.cat([first_frame_latents, overhead_broadcast], dim=1)
-        else:
-            first_frame_input = first_frame_latents
+        first_frame_input = first_frame_latents
 
         timestep_video = torch.zeros_like(timestep_action, dtype=first_frame_latents.dtype, device=self.device)
         video_pre = self.video_expert.pre_dit(

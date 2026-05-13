@@ -7,13 +7,11 @@ samples compatible with the FastWAM training pipeline.
 Architecture:
   - 9 condition frames (125cm_0deg): 8 uniformly sampled history + current frame
   - 8 future frames (125cm_0deg): for video generation training
-  - 1 overhead frame (125cm_30deg): at current timestep, separate conditioning
   - Total 0deg video: 17 frames (T%4==1 ✓) → 5 VAE latent frames
   - Action: predict_step_num relative waypoints (cubic spline resampled)
 
 Each sample contains:
   - video: [C, 17, H, W] — 0deg single-camera RGB video (9 cond + 8 future)
-  - overhead: [C, H, W] — 30deg overhead frame at current timestep
   - action: [predict_step_num, action_dim] — relative (x, y, theta, moving_flag) trajectory
   - action_is_pad: [predict_step_num] — padding mask for action
   - context: [context_len, text_dim] — cached T5 text embedding
@@ -593,12 +591,6 @@ class NavVideoDataset(torch.utils.data.Dataset):
         video = video * 2.0 - 1.0  # [0,1] → [-1,1]
         video = video.permute(1, 0, 2, 3)  # [C, 17, H, W]
 
-        # --- Load overhead frame (30deg at current timestep) ---
-        if start_frame_id < episode_length:
-            overhead = self._load_and_resize_frame(scene_path, self.overhead_camera, episode_idx, start_frame_id)
-        else:
-            overhead = torch.zeros(3, self.video_size[0], self.video_size[1])
-        overhead = overhead * 2.0 - 1.0  # [0,1] → [-1,1]
 
         # --- Actions: cubic spline interpolation + resampling ---
         poses = self._load_poses(scene_path, episode_idx, self.overhead_camera)
@@ -620,7 +612,6 @@ class NavVideoDataset(torch.utils.data.Dataset):
 
         data = {
             "video": video,                         # [C, 17, H, W]
-            "overhead": overhead,                   # [C, H, W]
             "action": action_tensor,                # [predict_step_num, 4]
             "action_is_pad": action_is_pad_tensor,  # [predict_step_num]
             "context": context,                     # [context_len, 4096]
