@@ -307,8 +307,8 @@ class NavVideoDataset(torch.utils.data.Dataset):
             f"Total video frames must satisfy T%4==1 for VAE, got {self.total_video_frames}"
         )
 
-        # Future frame stride: determined by goal_len at runtime, but video needs fixed frames
-        self.future_frame_stride = (num_frames - 1) // n_future_video_frames  # 4
+        # Future frame stride: fixed stride between consecutive future video frames
+        self.future_frame_stride = 1
 
         # Camera pitch for coordinate transform (extract from camera key)
         self._camera_deg = self._parse_camera_deg(self.overhead_camera)
