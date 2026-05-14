@@ -114,6 +114,16 @@ if [[ "${1:-}" == "--launch" ]]; then
     wait
     echo "[launcher] GPU occupy stopped."
 
+    # 清理上一次训练残余的 torchrun / train.py 进程，避免端口 29500 冲突
+    echo "[launcher] Cleaning up previous training processes on all nodes..."
+    for host in "${HOSTS[@]}"; do
+        ssh -o StrictHostKeyChecking=no "$host" \
+            "pkill -f 'torchrun.*train.py' 2>/dev/null; pkill -f 'python.*train.py' 2>/dev/null; true" &
+    done
+    wait
+    sleep 3  # 等待进程退出并释放端口
+    echo "[launcher] Previous training processes cleaned up."
+
     # 在 launcher 阶段统一生成 RUN_ID，分发给所有节点，跳过 TCPStore 同步
     RUN_ID="$(date +%Y-%m-%d_%H-%M-%S)"
     echo "============================================="

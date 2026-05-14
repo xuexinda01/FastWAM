@@ -12,13 +12,13 @@
 set -euo pipefail
 
 WORKER_IPS=(
-    28.216.19.80
-    28.216.19.91
-    28.216.19.205
-    28.216.19.208
-    28.216.19.83
     28.216.18.163
     28.216.19.161
+    28.216.19.91
+    28.216.18.202
+    28.216.19.83
+    28.216.19.80
+    28.216.19.208
 )
 
 TAIJI_CONFIG="/root/.taijiconfig"
@@ -28,7 +28,7 @@ CHECKPOINT_LOCAL="/tmp/fastwam_checkpoints"
 
 # 包含 master 在内的所有节点
 ALL_IPS=(
-    28.216.18.202
+    28.216.18.215
     "${WORKER_IPS[@]}"
 )
 
@@ -108,7 +108,7 @@ echo "============================================="
 declare -A COPY_PIDS
 
 for ip in "${ALL_IPS[@]}"; do
-    if [[ "$ip" == "28.216.18.202" ]]; then
+    if [[ "$ip" == "28.216.18.215" ]]; then
         # master 本地拷贝
         (
             mkdir -p "${CHECKPOINT_LOCAL}" && \
