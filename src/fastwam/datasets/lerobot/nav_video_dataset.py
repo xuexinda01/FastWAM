@@ -513,6 +513,18 @@ class NavVideoDataset(torch.utils.data.Dataset):
         poses = self._load_poses(scene_path, episode_idx, self.overhead_camera)
         actions, action_is_pad = self._compute_spline_actions(poses, start_frame_id, end_frame_id)
 
+        # --- Stop label: mark moving_flag=0 for points within 2m of goal ---
+        goal_pos = poses[-1, :3, 3]  # episode 终点的全局坐标
+        actual_end = min(start_frame_id + self.action_horizon, episode_length - 1)
+        for i in range(self.predict_step_num):
+            frac = (i + 1) / self.predict_step_num
+            interp_frame = start_frame_id + frac * (actual_end - start_frame_id)
+            interp_frame = min(int(interp_frame), episode_length - 1)
+            pos_i = poses[interp_frame, :3, 3]
+            dist_to_goal = np.linalg.norm(goal_pos - pos_i)
+            if dist_to_goal < 2.0:
+                action_is_pad[i] = True  # → moving_flag = 0
+
         # --- Text context ---
         prompt = DEFAULT_PROMPT.format(task=instruction)
         context, context_mask = self._get_cached_text_context(prompt)
