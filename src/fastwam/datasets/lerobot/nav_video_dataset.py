@@ -372,10 +372,22 @@ class NavVideoDataset(torch.utils.data.Dataset):
                             "instruction": instruction,
                         })
 
-                    # Terminal oversampling: near-end samples get shorter trajectories
+                    # Terminal oversampling: near-end samples get extra copies
+                    # Supports fractional ratios via probabilistic extra copy:
+                    #   ratio=0.5 → each terminal frame gets 1 extra copy with 50% probability (1.5x total)
+                    #   ratio=1.0 → always 1 extra copy (2x total)
+                    #   ratio=2.0 → always 2 extra copies (3x total)
                     terminal_start = max(0, ep_length - 5)
+                    # Use hashlib (not Python's hash()) for deterministic seed across all ranks.
+                    # Python's hash() is randomized per-process (PYTHONHASHSEED), which causes
+                    # different ranks to build datasets of different lengths → training crash.
+                    _seed_str = f"{scene_path}_{ep_idx}".encode()
+                    _seed = int(hashlib.md5(_seed_str).hexdigest(), 16) & 0xFFFFFFFF
+                    rng = np.random.default_rng(seed=_seed)
                     for current_idx in range(terminal_start, ep_length):
-                        n_extra = int(self.terminal_oversample_ratio)
+                        n_extra_int = int(self.terminal_oversample_ratio)
+                        frac_part = self.terminal_oversample_ratio - n_extra_int
+                        n_extra = n_extra_int + (1 if rng.random() < frac_part else 0)
                         for _ in range(n_extra):
                             self.samples.append({
                                 "scene_path": scene_path,
@@ -448,7 +460,7 @@ class NavVideoDataset(torch.utils.data.Dataset):
         traj_xy = discrete_traj[:, :2]
         steps = traj_xy[1:] - traj_xy[:-1]
         n_moving = (np.sum(steps**2, axis=1) > 0.05).sum()
-        if n_moving < 2:
+        if n_moving < 1:
             is_pad[1:] = True
 
         return resampled_actions.astype(np.float32), is_pad
@@ -513,17 +525,21 @@ class NavVideoDataset(torch.utils.data.Dataset):
         poses = self._load_poses(scene_path, episode_idx, self.overhead_camera)
         actions, action_is_pad = self._compute_spline_actions(poses, start_frame_id, end_frame_id)
 
-        # --- Stop label: mark moving_flag=0 for points within 2m of goal ---
+        # --- Stop label: mark moving_flag=0 for steps near goal (monotonic: once stopped, stays stopped) ---
+        # Bug fix: independent per-step check caused physically impossible "early stop, late move" labels.
+        # Fix: find the FIRST step within 1m of goal, then mark ALL steps from that index onward as stop.
         goal_pos = poses[-1, :3, 3]  # episode 终点的全局坐标
         actual_end = min(start_frame_id + self.action_horizon, episode_length - 1)
+        first_stop_step = self.predict_step_num  # default: no near-goal stop
         for i in range(self.predict_step_num):
             frac = (i + 1) / self.predict_step_num
-            interp_frame = start_frame_id + frac * (actual_end - start_frame_id)
-            interp_frame = min(int(interp_frame), episode_length - 1)
+            interp_frame = min(int(start_frame_id + frac * (actual_end - start_frame_id)), episode_length - 1)
             pos_i = poses[interp_frame, :3, 3]
             dist_to_goal = np.linalg.norm(goal_pos - pos_i)
-            if dist_to_goal < 2.0:
-                action_is_pad[i] = True  # → moving_flag = 0
+            if dist_to_goal < 1.0:  # reduced from 2.0m → 1.0m
+                first_stop_step = i
+                break  # monotonic: all subsequent steps will also be stop
+        action_is_pad[first_stop_step:] = True  # mark first_stop_step and all later steps as stop
 
         # --- Text context ---
         prompt = DEFAULT_PROMPT.format(task=instruction)
