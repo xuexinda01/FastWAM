@@ -159,6 +159,7 @@ class Wan22Trainer:
         self.optimizer.zero_grad(set_to_none=True)
         self.wandb_run = None
         self._init_wandb()
+        self._init_metric_loggers()
         self._resume_or_load_checkpoint()
 
         val_size = len(self.val_dataset) if self.val_dataset is not None else len(self.train_dataset)
@@ -199,6 +200,40 @@ class Wan22Trainer:
             return
         self.wandb_run.finish()
         self.wandb_run = None
+
+    def _init_metric_loggers(self):
+        """rank0-only file loggers for waypoint-fit diagnostics.
+
+        Produces two append-mode log files under <output_dir>/metric_logs/:
+          - waypoint_train.log : Scheme A — closed-form single-step waypoint
+            reconstruction (one line per `log_every` steps, written from
+            training_loss's `wp_*` fields).
+          - waypoint_eval.log  : Scheme B — full multi-step denoising via
+            `model.infer(...)` then waypoint MSE/MAE vs GT (one line per
+            `eval_every` steps, written from evaluate()'s `vln_wp_*` fields).
+        """
+        self.log_a = None
+        self.log_b = None
+        if not self.accelerator.is_main_process:
+            return
+        log_dir = os.path.join(self.output_dir, "metric_logs")
+        ensure_dir(log_dir)
+
+        def _build(name: str, filename: str):
+            lg = logging.getLogger(f"fastwam.metric.{name}")
+            lg.setLevel(logging.INFO)
+            # Avoid duplicate handlers when __init__ runs more than once (resume).
+            for h in list(lg.handlers):
+                lg.removeHandler(h)
+            fh = logging.FileHandler(os.path.join(log_dir, filename), mode="a")
+            fh.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+            lg.addHandler(fh)
+            lg.propagate = False
+            return lg
+
+        self.log_a = _build("waypoint_train", "waypoint_train.log")
+        self.log_b = _build("waypoint_eval", "waypoint_eval.log")
+        logger.info("Metric loggers initialized under %s", log_dir)
 
     def _build_loader(self, dataset, worker_init_fn=None):
         self.train_sampler = ResumableEpochSampler(
@@ -539,9 +574,30 @@ class Wan22Trainer:
         action_l2 = None
         if action is not None and pred_action is not None:
             if sample.get("proprio") is None:
-                # Skip action denormalization metrics when `proprio` is unavailable
-                # (e.g., VLN datasets without proprioception data)
-                pass
+                # Scheme B for VLN: no proprio / normalizer pipeline, compare
+                # in the *×4 normalized space and divide xy errors by 4 to
+                # report meters (matches NavVideoDataset.interpolate_and_resample_trajectory).
+                gt_t = action.detach().float().cpu()                # [T, 4]
+                pr_t = pred_action.detach().float().cpu()           # [T, 4] or [1, T, 4]
+                if pr_t.ndim == 3:
+                    pr_t = pr_t.squeeze(0)
+                if pr_t.shape != gt_t.shape:
+                    raise ValueError(
+                        "VLN eval action shape mismatch: "
+                        f"pred={tuple(pr_t.shape)} vs gt={tuple(gt_t.shape)}"
+                    )
+                diff = pr_t - gt_t                                  # [T, 4]
+                xy_l2 = diff[..., 0:2].pow(2).sum(-1).sqrt()        # [T]
+                action_l1 = float(diff.abs().mean().item())
+                action_l2 = float(diff.pow(2).mean().item())
+                _DENORM = 4.0
+                self._last_vln_eval_extra = {
+                    "wp_xy_mae_m":          float(xy_l2.mean().item()) / _DENORM,
+                    "wp_xy_first_mae_m":    float(xy_l2[0].item())     / _DENORM,
+                    "wp_xy_endpoint_mae_m": float(xy_l2[-1].item())    / _DENORM,
+                    "wp_dtheta_mae_rad":    float(diff[..., 2].abs().mean().item()),
+                    "wp_moving_flag_mae":   float(diff[..., 3].abs().mean().item()),
+                }
             else:
                 proprio = sample["proprio"].detach().to(device="cpu", dtype=torch.float32)
 
@@ -666,6 +722,12 @@ class Wan22Trainer:
             result["action_l2"] = float(action_l2_mean)
         if action_l1_mean is not None:
             result["action_l1"] = float(action_l1_mean)
+        # Scheme B (VLN): per-rank, rank0-only extras stashed by the VLN branch above.
+        # Not averaged across ranks (each rank evaluates on its own sample).
+        extra = getattr(self, "_last_vln_eval_extra", None)
+        if extra is not None:
+            result.update({f"vln_{k}": v for k, v in extra.items()})
+            self._last_vln_eval_extra = None
         return result
 
     def _save_weights_checkpoint(self, step_tag: str):
@@ -829,6 +891,19 @@ class Wan22Trainer:
                             wandb_payload[f"train/{key}"] = value
                         self._wandb_log(wandb_payload)
 
+                        # Scheme A: write waypoint-fit line to dedicated log file.
+                        if self.log_a is not None:
+                            wp_keys = sorted(k for k in global_loss_metrics if k.startswith("wp_"))
+                            if wp_keys:
+                                pieces = " ".join(f"{k}={global_loss_metrics[k]:.6f}" for k in wp_keys)
+                                self.log_a.info(
+                                    "step=%d epoch=%d loss_action=%.6f %s",
+                                    self.global_step,
+                                    self.epoch,
+                                    global_loss_metrics.get("loss_action", float("nan")),
+                                    pieces,
+                                )
+
                     if (
                         self.eval_every > 0
                         and self.val_dataset is not None
@@ -861,7 +936,22 @@ class Wan22Trainer:
                                 eval_payload["eval/action_l2"] = float(metrics["action_l2"])
                             if "action_l1" in metrics:
                                 eval_payload["eval/action_l1"] = float(metrics["action_l1"])
+                            # Scheme B: surface VLN waypoint metrics in both wandb and the dedicated log file.
+                            vln_keys = sorted(k for k in metrics if k.startswith("vln_wp_"))
+                            for k in vln_keys:
+                                eval_payload[f"eval/{k}"] = float(metrics[k])
                             self._wandb_log(eval_payload)
+
+                            if self.log_b is not None and vln_keys:
+                                pieces = " ".join(f"{k}={metrics[k]:.6f}" for k in vln_keys)
+                                self.log_b.info(
+                                    "step=%d val_loss=%.6f action_l1=%.6f action_l2=%.6f %s",
+                                    self.global_step,
+                                    float(metrics["val_loss"]),
+                                    float(metrics.get("action_l1", float("nan"))),
+                                    float(metrics.get("action_l2", float("nan"))),
+                                    pieces,
+                                )
 
                     if self.save_every > 0 and self.global_step % self.save_every == 0:
                         ckpt_info = self.save_checkpoint()

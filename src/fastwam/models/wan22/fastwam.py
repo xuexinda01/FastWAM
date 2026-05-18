@@ -659,6 +659,34 @@ class FastWAM(torch.nn.Module):
             loss_total = loss_total + loss_stop
             loss_dict["loss_stop"] = float(loss_stop.detach().item())
 
+        # === Scheme A: closed-form single-step waypoint reconstruction (diagnostic only) ===
+        # flow-matching:  noisy = (1-σ)·x + σ·ε,  target = ε - x
+        #   ⇒ x_hat = noisy - σ * pred_velocity   (single-step linear inversion)
+        # This is cheap (one mul-add, no grad) and lets us monitor fit-quality
+        # in meters/radians instead of the abstract velocity-MSE used by `loss_action`.
+        # NOTE: dx/dy were *×4* in NavVideoDataset.interpolate_and_resample_trajectory,
+        # so we divide xy errors by 4 here to report meters.
+        with torch.no_grad():
+            _num_t = float(self.train_action_scheduler.num_train_timesteps)
+            sigma = (timestep_action.float() / _num_t).to(pred_action.device)
+            sigma_b = sigma.view(-1, *([1] * (noisy_action.ndim - 1)))
+            pred_wp = noisy_action.float() - sigma_b * pred_action.float()  # [B, T, 4]
+            gt_wp = action.float()
+            err = pred_wp - gt_wp                                            # [B, T, 4]
+            xy_l2 = err[..., 0:2].pow(2).sum(-1).sqrt()                      # [B, T]
+            _DENORM = 4.0
+            loss_dict["wp_xy_mae_m"]          = float(xy_l2.mean().item()) / _DENORM
+            loss_dict["wp_xy_first_mae_m"]    = float(xy_l2[:, 0].mean().item()) / _DENORM
+            loss_dict["wp_xy_endpoint_mae_m"] = float(xy_l2[:, -1].mean().item()) / _DENORM
+            loss_dict["wp_dtheta_mae_rad"]    = float(err[..., 2].abs().mean().item())
+            loss_dict["wp_moving_flag_mae"]   = float(err[..., 3].abs().mean().item())
+            # σ-restricted view: single-step inversion is only accurate at small σ,
+            # so this metric is the closest analytic proxy for "real inference error".
+            small_mask = (sigma < 0.2)
+            if small_mask.any():
+                xy_l2_flat = xy_l2.mean(dim=1)  # [B]
+                loss_dict["wp_xy_mae_smallsig_m"] = float(xy_l2_flat[small_mask].mean().item()) / _DENORM
+
         return loss_total, loss_dict
 
     @torch.no_grad()
