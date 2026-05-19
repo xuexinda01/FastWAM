@@ -682,10 +682,21 @@ class FastWAM(torch.nn.Module):
             loss_dict["wp_moving_flag_mae"]   = float(err[..., 3].abs().mean().item())
             # σ-restricted view: single-step inversion is only accurate at small σ,
             # so this metric is the closest analytic proxy for "real inference error".
+            #
+            # IMPORTANT: this key MUST be inserted unconditionally to keep the
+            # set of keys in `loss_dict` identical across all ranks. The trainer
+            # gathers each metric one-by-one via per-key all-gather, and any
+            # rank-conditional key triggers an NCCL ALLGATHER timeout (~600s)
+            # whenever some rank's batch happens to have no σ<0.2 samples.
             small_mask = (sigma < 0.2)
+            xy_l2_flat = xy_l2.mean(dim=1)  # [B]
             if small_mask.any():
-                xy_l2_flat = xy_l2.mean(dim=1)  # [B]
-                loss_dict["wp_xy_mae_smallsig_m"] = float(xy_l2_flat[small_mask].mean().item()) / _DENORM
+                _smallsig = float(xy_l2_flat[small_mask].mean().item()) / _DENORM
+            else:
+                # Use NaN as a sentinel; it will average across ranks to NaN
+                # only on steps where every rank lacks small-σ samples (rare).
+                _smallsig = float("nan")
+            loss_dict["wp_xy_mae_smallsig_m"] = _smallsig
 
         return loss_total, loss_dict
 
