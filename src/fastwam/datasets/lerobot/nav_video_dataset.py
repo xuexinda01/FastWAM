@@ -162,12 +162,14 @@ def smooth_and_resample_trajectory(points: np.ndarray, sample_length: int = 33, 
 
 
 def xy_to_delta_xyt(xy_actions: np.ndarray) -> np.ndarray:
-    """Convert absolute (x, y) positions to relative (dx, dy, delta_yaw).
+    """[LEGACY] Convert absolute (x, y) positions to relative (dx, dy, delta_yaw).
     
-    For "stopped" steps (xy displacement < threshold), reuse the previous step's
-    yaw to avoid the atan2(0, 0) singularity. This makes delta_yaw=0 at stop
-    steps, which matches the physical intuition that a non-moving robot doesn't
-    "turn 57 degrees in place" just because of a numerical edge case.
+    NOTE (2026-05-20): This function is kept for backward compatibility but is
+    NO LONGER USED by the current `_compute_spline_actions`. The new pipeline
+    uses real robot yaw from pose matrices (see `_compute_spline_actions_v2`)
+    instead of inferring yaw from xy displacement direction. This function
+    has the well-known limitation that pure in-place rotations are completely
+    invisible to the resulting `delta_yaw` (which is just `arctan2(Δy, Δx)`).
     """
     vectors = np.diff(xy_actions, axis=0)              # [N-1, 2]
     norms = np.linalg.norm(vectors, axis=1)             # [N-1]
@@ -189,6 +191,130 @@ def xy_to_delta_xyt(xy_actions: np.ndarray) -> np.ndarray:
 
     delta_xyt = np.concatenate([vectors, delta_yaw[:, None]], axis=1)
     return delta_xyt
+
+
+# =============================================================================
+# NEW (2026-05-20) action-label pipeline
+#
+# Replaces the old `interpolate_and_resample_trajectory` + `xy_to_delta_xyt`
+# pipeline. Key differences:
+#   1. Does NOT mask out static (in-place rotation) frames. They participate
+#      in resampling via the progress parameter `s`.
+#   2. Uses REAL robot yaw from pose matrices (the third column of
+#      `get_trajectory_relative_to_frame`'s output), not yaw inferred from
+#      xy displacement direction.
+#   3. Resamples on a synthetic progress parameter
+#          s_i = ||Δxy_i||  +  alpha * |Δyaw_i|
+#      so 1 frame of FORWARD (0.25 m) and 1 frame of TURN_15° (0.262 rad)
+#      contribute equally to progress when alpha=0.95.
+#   4. Outputs are normalized to roughly [-1, 1] using empirical 99th
+#      percentile scaling (computed via scripts/compute_action_stats.py).
+#      Inference must reverse this with the same constants.
+# =============================================================================
+
+# Empirical 99% percentile scaling (computed on debugdata, alpha=0.95).
+# scripts/compute_action_stats.py reproduces these.
+ACTION_PROGRESS_ALPHA = 0.95
+ACTION_SCALE = np.array([0.2504, 0.2165, 0.2625], dtype=np.float32)
+# layout: [forward_per_step (m), left_per_step (m), dyaw_per_step (rad)]
+
+
+def normalize_action(actions_unnorm: np.ndarray) -> np.ndarray:
+    """Divide each dim by its scale and clip to [-1, 1].
+
+    Args:
+        actions_unnorm: shape (T, 3) or (..., 3), in physical units
+                        (forward m, left m, dyaw rad).
+
+    Returns:
+        actions_norm in [-1, 1].
+    """
+    return np.clip(actions_unnorm / ACTION_SCALE, -1.0, 1.0)
+
+
+def denormalize_action(actions_norm: np.ndarray) -> np.ndarray:
+    """Inverse of `normalize_action` (no clipping, since clipping was at
+    train time and would be incorrect at inference)."""
+    return actions_norm * ACTION_SCALE
+
+
+def compute_spline_actions_v2(
+    poses: np.ndarray,
+    start_idx: int,
+    end_idx: int,
+    *,
+    predict_step_num: int,
+    camera_deg: float,
+    alpha: float = ACTION_PROGRESS_ALPHA,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """New action-label pipeline. See module-level docstring above for context.
+
+    Args:
+        poses:            (N, 4, 4) camera extrinsics for the whole episode.
+        start_idx, end_idx: segment is poses[start_idx:end_idx].
+        predict_step_num: number of output action steps (T).
+        camera_deg:       pitch correction (typically 30).
+        alpha:            yaw-vs-translation weighting (m / rad).
+
+    Returns:
+        actions_normalized: (T, 3) in [-1, 1], dims = (forward, left, dyaw).
+        is_pad: (T,) True where the step has effectively zero motion (used as
+                moving_flag inverse).
+    """
+    seg_poses = poses[start_idx:end_idx]
+    seg_len = len(seg_poses)
+    if seg_len < 2:
+        return (np.zeros((predict_step_num, 3), dtype=np.float32),
+                np.ones(predict_step_num, dtype=bool))
+
+    # 1. Extract robot-frame (x, y, yaw)
+    rel = get_trajectory_relative_to_frame(seg_poses, camera_deg=camera_deg)
+    xy = rel[:, :2]
+    yaw = np.unwrap(rel[:, 2])  # unwrap to avoid ±π discontinuities
+
+    # 2. Build progress parameter `s`
+    delta_xy = np.diff(xy, axis=0)
+    delta_yaw_raw = np.diff(yaw)
+    ds = np.linalg.norm(delta_xy, axis=1) + alpha * np.abs(delta_yaw_raw)
+    s = np.concatenate([[0.0], np.cumsum(ds)])  # (seg_len,)
+
+    # If nothing happened in this whole segment, return zeros + all-pad.
+    if s[-1] < 1e-6:
+        return (np.zeros((predict_step_num, 3), dtype=np.float32),
+                np.ones(predict_step_num, dtype=bool))
+
+    # 3. Resample at evenly-spaced s
+    s_target = np.linspace(0.0, s[-1], predict_step_num + 1)
+
+    if seg_len >= 4:
+        cs_x = CubicSpline(s, xy[:, 0])
+        cs_y = CubicSpline(s, xy[:, 1])
+        x_resampled = cs_x(s_target)
+        y_resampled = cs_y(s_target)
+    else:
+        x_resampled = np.interp(s_target, s, xy[:, 0])
+        y_resampled = np.interp(s_target, s, xy[:, 1])
+    yaw_resampled = np.interp(s_target, s, yaw)  # linear is enough for angle
+
+    # 4. Per-step deltas
+    dx = np.diff(x_resampled)
+    dy = np.diff(y_resampled)
+    dyaw = np.diff(yaw_resampled)
+    dyaw = (dyaw + np.pi) % (2.0 * np.pi) - np.pi  # wrap each step
+
+    actions_unnorm = np.stack([dx, dy, dyaw], axis=1).astype(np.float32)
+
+    # 5. Moving flag: a step "moved" if either xy or yaw changed appreciably.
+    EPS_XY = 0.01      # 1 cm
+    EPS_YAW = np.deg2rad(0.5)
+    moved = (np.linalg.norm(actions_unnorm[:, :2], axis=1) > EPS_XY) | \
+            (np.abs(actions_unnorm[:, 2]) > EPS_YAW)
+    is_pad = ~moved
+
+    # 6. Normalize
+    actions_norm = normalize_action(actions_unnorm).astype(np.float32)
+
+    return actions_norm, is_pad
 
 
 def interpolate_and_resample_trajectory(
@@ -279,6 +405,7 @@ class NavVideoDataset(torch.utils.data.Dataset):
         terminal_oversample_ratio: float = 3.0,
         predict_step_num: int = 32,
         min_goal_len: int = 3,
+        class_oversample: Optional[dict] = None,
         **kwargs,
     ):
         super().__init__()
@@ -301,6 +428,16 @@ class NavVideoDataset(torch.utils.data.Dataset):
         self.terminal_oversample_ratio = terminal_oversample_ratio
         self.predict_step_num = predict_step_num
         self.min_goal_len = min_goal_len
+        # Class-balanced oversampling. Default duplicates BIG_TURN ×4,
+        # SMALL_TURN ×2, TERMINAL ×3 so the rare-but-important categories get
+        # adequate gradient signal vs. the dominant FWD majority.
+        self.class_oversample = class_oversample or {
+            "FWD": 1,
+            "SMALL_TURN": 2,
+            "BIG_TURN": 4,
+            "TERMINAL": 3,
+            "OTHER": 1,
+        }
 
         # Action output dimension: (dx, dy, d_theta, moving_flag)
         self.action_dim = 4
@@ -322,10 +459,28 @@ class NavVideoDataset(torch.utils.data.Dataset):
         # Build index
         self.samples = []
         self._build_index(dataset_dirs)
+        # Categorize each sample (FWD / SMALL_TURN / BIG_TURN / TERMINAL) so
+        # we can balance class proportions via physical oversampling.
+        self.sample_categories = self._classify_samples()
+        # Class-balanced oversampling: physically duplicate under-represented
+        # categories (BIG_TURN, SMALL_TURN, TERMINAL) so that
+        # ResumableEpochSampler naturally sees a balanced stream.
+        self._apply_class_oversampling(class_oversample)
         logger.info(
             f"NavVideoDataset: {len(self.samples)} samples, "
             f"action_horizon={self.action_horizon}, future_stride={self.future_frame_stride}, "
             f"predict_step_num={predict_step_num}, n_future_video={n_future_video_frames}"
+        )
+        # Log class distribution for visibility
+        from collections import Counter
+        _cnt = Counter(self.sample_categories)
+        logger.info(
+            f"NavVideoDataset class distribution (post-oversampling): "
+            f"FWD={_cnt.get('FWD', 0)} "
+            f"SMALL_TURN={_cnt.get('SMALL_TURN', 0)} "
+            f"BIG_TURN={_cnt.get('BIG_TURN', 0)} "
+            f"TERMINAL={_cnt.get('TERMINAL', 0)} "
+            f"OTHER={_cnt.get('OTHER', 0)}"
         )
 
     @staticmethod
@@ -446,41 +601,116 @@ class NavVideoDataset(torch.utils.data.Dataset):
         poses = np.array([np.vstack(p) for p in poses_raw])
         return poses
 
+    def _classify_samples(self) -> List[str]:
+        """Assign one of {FWD, SMALL_TURN, BIG_TURN, TERMINAL, OTHER} to each
+        sample, based on the magnitude of motion within its action segment.
+
+        TERMINAL takes precedence: any sample whose segment ends at or past the
+        episode end gets labelled TERMINAL (so STOP/near-goal supervision is
+        always counted as TERMINAL, regardless of motion).
+
+        Used by `get_sampler_weights()` for class-balanced training. We cache
+        per-episode pose arrays to avoid re-reading the same parquet for
+        different samples on the same episode.
+        """
+        TURN_THRESHOLD_SMALL = np.deg2rad(15)   # > 15° within horizon
+        TURN_THRESHOLD_BIG = np.deg2rad(45)    # > 45°  → BIG_TURN
+        FWD_THRESHOLD = 0.30                    # > 30 cm xy displacement
+        TERMINAL_FRAMES = 5                     # within last 5 frames of ep
+
+        cats: List[str] = []
+        pose_cache: dict = {}
+        for s_idx, info in enumerate(self.samples):
+            sfid = info["start_frame_id"]
+            ep_len = info["episode_length"]
+            end = min(sfid + self.action_horizon + 1, ep_len)
+
+            # TERMINAL takes precedence: segment that hits or passes the very
+            # end of the episode is a "must learn STOP" sample.
+            if end >= ep_len - 0:  # i.e. segment includes the last frame
+                cats.append("TERMINAL")
+                continue
+            # Also cover: original segment was clamped because horizon ran out.
+            if (end - sfid) < self.action_horizon + 1:
+                cats.append("TERMINAL")
+                continue
+
+            cache_key = (info["scene_path"], info["episode_idx"])
+            if cache_key not in pose_cache:
+                try:
+                    pose_cache[cache_key] = self._load_poses(
+                        info["scene_path"], info["episode_idx"], self.overhead_camera
+                    )
+                except Exception as e:
+                    logger.warning(f"_classify_samples: failed to load poses "
+                                   f"for {cache_key}: {e}")
+                    cats.append("OTHER")
+                    continue
+            poses = pose_cache[cache_key]
+            if end > len(poses):
+                cats.append("OTHER")
+                continue
+
+            try:
+                rel = get_trajectory_relative_to_frame(
+                    poses[sfid:end], camera_deg=self._camera_deg
+                )
+            except Exception:
+                cats.append("OTHER")
+                continue
+            xy = rel[:, :2]
+            yaw = np.unwrap(rel[:, 2])
+            d_xy_total = float(np.linalg.norm(xy[-1] - xy[0]))
+            d_yaw_total = float(abs(yaw[-1] - yaw[0]))
+
+            if d_yaw_total >= TURN_THRESHOLD_BIG:
+                cats.append("BIG_TURN")
+            elif d_yaw_total >= TURN_THRESHOLD_SMALL:
+                cats.append("SMALL_TURN")
+            elif d_xy_total >= FWD_THRESHOLD:
+                cats.append("FWD")
+            else:
+                cats.append("OTHER")
+        return cats
+
+    def _apply_class_oversampling(self, class_oversample_override: Optional[dict] = None):
+        """Physically duplicate under-represented samples in `self.samples`.
+
+        Reads `self.class_oversample` (or override) which maps category →
+        integer multiplier. A sample of category C with multiplier K appears
+        K times in the final list (K=1 means no change).
+
+        Updates both `self.samples` and `self.sample_categories` in place.
+        """
+        cfg = class_oversample_override if class_oversample_override is not None \
+            else self.class_oversample
+        new_samples = []
+        new_cats = []
+        for s, c in zip(self.samples, self.sample_categories):
+            mult = int(cfg.get(c, 1))
+            mult = max(1, mult)
+            for _ in range(mult):
+                new_samples.append(s)
+                new_cats.append(c)
+        self.samples = new_samples
+        self.sample_categories = new_cats
+
     def _compute_spline_actions(
         self, poses: np.ndarray, start_idx: int, end_idx: int
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Compute action labels using cubic spline interpolation.
+        Compute action labels using the v2 (yaw-aware) pipeline.
 
-        Takes poses[start_idx:end_idx], converts to relative coords,
-        filters static points, applies cubic spline, resamples to predict_step_num.
-
-        Returns:
-            actions: [predict_step_num, 3] — (dx, dy, d_theta) per step.
-            is_pad: [predict_step_num] — True where padded.
+        Output is normalized to [-1, 1] using ACTION_SCALE constants.
+        Output dims: (Δforward, Δleft, Δyaw) per step.
+        See `compute_spline_actions_v2` for details.
         """
-        segment_poses = poses[start_idx:end_idx]
-        segment_len = len(segment_poses)
-
-        if segment_len < 2:
-            actions = np.zeros((self.predict_step_num, 3), dtype=np.float32)
-            is_pad = np.ones(self.predict_step_num, dtype=bool)
-            return actions, is_pad
-
-        discrete_traj = get_trajectory_relative_to_frame(segment_poses, camera_deg=self._camera_deg)
-
-        _, resampled_actions = interpolate_and_resample_trajectory(discrete_traj, self.predict_step_num)
-        resampled_actions = clip_or_pad(resampled_actions, self.predict_step_num)
-
-        is_pad = np.zeros(self.predict_step_num, dtype=bool)
-
-        traj_xy = discrete_traj[:, :2]
-        steps = traj_xy[1:] - traj_xy[:-1]
-        n_moving = (np.sum(steps**2, axis=1) > 0.05).sum()
-        if n_moving < 1:
-            is_pad[1:] = True
-
-        return resampled_actions.astype(np.float32), is_pad
+        return compute_spline_actions_v2(
+            poses, start_idx, end_idx,
+            predict_step_num=self.predict_step_num,
+            camera_deg=self._camera_deg,
+            alpha=ACTION_PROGRESS_ALPHA,
+        )
 
     def _get_history_indices(self, start_frame_id: int) -> List[int]:
         """Uniformly sample n_history_frames indices from [0, start_frame_id-1]."""

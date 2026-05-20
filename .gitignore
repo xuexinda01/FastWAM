@@ -252,3 +252,8 @@ manifest.json
 wandb/
 onelogger.err
 onelogger.log
+
+# Local visualization / verification artifacts (excluded from git)
+visualizations/
+scripts/_verify_out/
+scripts/_action_stats.json
