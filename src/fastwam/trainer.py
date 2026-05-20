@@ -455,8 +455,16 @@ class Wan22Trainer:
                 action = action.unsqueeze(0)
             if action.ndim != 3:
                 raise ValueError(f"`sample['action']` must be 3D [B, T, a_dim], got shape {tuple(action.shape)}")
-            if action.shape[1] % (num_video_frames - 1) != 0:
-                raise ValueError(f"`sample['action']` temporal dimension must be divisible by video frames-1={num_video_frames - 1}, got {action.shape[1]}")
+            # if action.shape[1] % (num_video_frames - 1) != 0:
+            #     raise ValueError(f"`sample['action']` temporal dimension must be divisible by video frames-1={num_video_frames - 1}, got {action.shape[1]}")
+            num_latent_frames = (num_video_frames + 3) // 4
+            denom = max(num_latent_frames - 1, 1)
+            if action.shape[1] % denom != 0 and denom % action.shape[1] != 0:
+                raise ValueError(
+                    f"`sample['action']` temporal length ({action.shape[1]}) and "
+                    f"video latent frames-1 ({denom}) must be integer multiples of "
+                    f"each other (action denser than video, or video denser than action)."
+                )
             action_horizon = int(action.shape[1])
 
         proprio = None

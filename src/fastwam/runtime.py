@@ -471,6 +471,7 @@ def run_training(cfg: DictConfig):
         train_dataset=train_ds,
         val_dataset=val_ds,
     )
+    test=train_ds[0]
     trainer.train()
 
 def run_inference(cfg: DictConfig):

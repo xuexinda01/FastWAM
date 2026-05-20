@@ -162,9 +162,26 @@ def smooth_and_resample_trajectory(points: np.ndarray, sample_length: int = 33, 
 
 
 def xy_to_delta_xyt(xy_actions: np.ndarray) -> np.ndarray:
-    """Convert absolute (x, y) positions to relative (dx, dy, delta_yaw)."""
-    vectors = np.diff(xy_actions, axis=0)
-    yaw = np.arctan2(vectors[:, 1], vectors[:, 0])
+    """Convert absolute (x, y) positions to relative (dx, dy, delta_yaw).
+    
+    For "stopped" steps (xy displacement < threshold), reuse the previous step's
+    yaw to avoid the atan2(0, 0) singularity. This makes delta_yaw=0 at stop
+    steps, which matches the physical intuition that a non-moving robot doesn't
+    "turn 57 degrees in place" just because of a numerical edge case.
+    """
+    vectors = np.diff(xy_actions, axis=0)              # [N-1, 2]
+    norms = np.linalg.norm(vectors, axis=1)             # [N-1]
+    STOP_EPS = 1e-6                                     # below this = "no motion"
+
+    # Compute yaw safely: reuse previous valid yaw at stop steps.
+    yaw = np.zeros(len(vectors), dtype=vectors.dtype)
+    last_yaw = 0.0  # default for the very first step if it's a stop
+    for i in range(len(vectors)):
+        if norms[i] < STOP_EPS:
+            yaw[i] = last_yaw
+        else:
+            yaw[i] = np.arctan2(vectors[i, 1], vectors[i, 0])
+            last_yaw = yaw[i]
 
     delta_yaw = np.diff(yaw)
     delta_yaw = (delta_yaw + np.pi) % (2 * np.pi) - np.pi
@@ -493,7 +510,7 @@ class NavVideoDataset(torch.utils.data.Dataset):
         episode_length = sample_info["episode_length"]
         instruction = sample_info["instruction"]
 
-        # Action end frame: start + 16, clamped to episode end
+        # Action end frame: start + 8, clamped to episode end
         # Near terminal, this naturally becomes shorter
         end_frame_id = min(start_frame_id + self.action_horizon + 1, episode_length)
 
