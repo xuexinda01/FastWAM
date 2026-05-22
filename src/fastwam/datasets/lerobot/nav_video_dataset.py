@@ -28,6 +28,8 @@ Each sample contains:
 import hashlib
 import json
 import os
+import pickle
+import time
 import traceback
 from typing import List, Optional, Tuple
 
@@ -612,7 +614,43 @@ class NavVideoDataset(torch.utils.data.Dataset):
         Used by `get_sampler_weights()` for class-balanced training. We cache
         per-episode pose arrays to avoid re-reading the same parquet for
         different samples on the same episode.
+
+        Results are cached to /tmp for fast reload on subsequent launches.
         """
+        # --- Disk cache: compute a hash key from dataset identity ---
+        cache_key_str = json.dumps({
+            "n_samples": len(self.samples),
+            "action_horizon": self.action_horizon,
+            "overhead_camera": self.overhead_camera,
+            "camera_deg": self._camera_deg,
+            "first_sample": str(self.samples[0]) if self.samples else "",
+            "last_sample": str(self.samples[-1]) if self.samples else "",
+        }, sort_keys=True)
+        cache_hash = hashlib.md5(cache_key_str.encode()).hexdigest()[:12]
+        _shared_cache_dir = "/apdcephfs_qy2/share_303214315/hunyuan/xxd/FastWAM/.cache"
+        os.makedirs(_shared_cache_dir, exist_ok=True)
+        cache_path = f"{_shared_cache_dir}/nav_classify_cache_{cache_hash}.pkl"
+
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, "rb") as f:
+                    cached = pickle.load(f)
+                if len(cached) == len(self.samples):
+                    logger.info(f"_classify_samples: loaded from disk cache {cache_path}")
+                    return cached
+                else:
+                    logger.warning(f"_classify_samples: cache size mismatch "
+                                   f"({len(cached)} vs {len(self.samples)}), recomputing.")
+            except Exception as e:
+                logger.warning(f"_classify_samples: failed to load cache: {e}")
+        else:
+            logger.warning(f"_classify_samples: cache not found at {cache_path} "
+                           f"(hash={cache_hash})")
+
+        logger.info(f"_classify_samples: computing classifications for "
+                    f"{len(self.samples)} samples (this may take a while on NFS)...")
+        t0 = time.time()
+
         TURN_THRESHOLD_SMALL = np.deg2rad(15)   # > 15° within horizon
         TURN_THRESHOLD_BIG = np.deg2rad(45)    # > 45°  → BIG_TURN
         FWD_THRESHOLD = 0.30                    # > 30 cm xy displacement
@@ -671,6 +709,17 @@ class NavVideoDataset(torch.utils.data.Dataset):
                 cats.append("FWD")
             else:
                 cats.append("OTHER")
+
+        # --- Save to disk cache for fast reload next time ---
+        elapsed = time.time() - t0
+        try:
+            with open(cache_path, "wb") as f:
+                pickle.dump(cats, f)
+            logger.info(f"_classify_samples: done in {elapsed:.1f}s, "
+                        f"saved cache to {cache_path}")
+        except Exception as e:
+            logger.warning(f"_classify_samples: done in {elapsed:.1f}s, "
+                           f"but failed to save cache: {e}")
         return cats
 
     def _apply_class_oversampling(self, class_oversample_override: Optional[dict] = None):

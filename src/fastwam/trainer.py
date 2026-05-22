@@ -508,15 +508,29 @@ class Wan22Trainer:
         was_dit_training = model.dit.training
         model.eval()
 
-        # eval_index = (self.global_step + self.accelerator.process_index) % len(self.val_dataset)
+        # Evaluate multiple samples per GPU for more stable val_loss
+        n_eval_samples = int(getattr(self.cfg, "n_eval_samples_per_gpu", 4))
         rng = torch.Generator(device="cpu").manual_seed(self.global_step + self.accelerator.process_index)
-        eval_index = torch.randint(0, len(self.val_dataset), (1,), generator=rng).item()
-        sample = self._to_batched_eval_sample(self.val_dataset[eval_index])
 
-        # 1. training loss
-        with self.accelerator.autocast():
-            val_loss, _ = model.training_loss(sample)
-            val_loss = val_loss.float().item()
+        # Accumulate val_loss over multiple samples
+        val_losses = []
+        val_losses_video = []
+        val_losses_action = []
+        for _ in range(n_eval_samples):
+            eval_index = torch.randint(0, len(self.val_dataset), (1,), generator=rng).item()
+            _sample = self._to_batched_eval_sample(self.val_dataset[eval_index])
+            with self.accelerator.autocast():
+                _vl, _vl_dict = model.training_loss(_sample)
+                val_losses.append(_vl.float().item())
+                val_losses_video.append(_vl_dict.get("loss_video", 0.0))
+                val_losses_action.append(_vl_dict.get("loss_action", 0.0))
+
+        val_loss = sum(val_losses) / len(val_losses)
+        val_loss_video = sum(val_losses_video) / len(val_losses_video)
+        val_loss_action = sum(val_losses_action) / len(val_losses_action)
+
+        # Use the last sample for inference metrics
+        sample = _sample
 
         # When using a non-VAE visual encoder (DINO / V-JEPA2), video decode
         # is unavailable, so we skip inference, video metrics and VAE recon.
@@ -704,6 +718,8 @@ class Wan22Trainer:
                 float(ssim_decode_vs_gt),
                 float(action_l2) if action_l2 is not None else -1.0,
                 float(action_l1) if action_l1 is not None else -1.0,
+                float(val_loss_video),
+                float(val_loss_action),
             ],
             device=self.accelerator.device,
             dtype=torch.float32,
@@ -712,12 +728,16 @@ class Wan22Trainer:
         mean_metrics = gathered_metrics[:, :7].mean(dim=0)
         action_l2_mean = gathered_metrics[:, 7].mean().item() if action_l2 is not None else None
         action_l1_mean = gathered_metrics[:, 8].mean().item() if action_l1 is not None else None
+        val_loss_video_mean = gathered_metrics[:, 9].mean().item()
+        val_loss_action_mean = gathered_metrics[:, 10].mean().item()
 
         if was_dit_training:
             self._set_dit_only_train_mode()
 
         result = {
             "val_loss": float(mean_metrics[0].item()),
+            "val_loss_video": float(val_loss_video_mean),
+            "val_loss_action": float(val_loss_action_mean),
             "psnr_rg": float(mean_metrics[1].item()),
             "ssim_rg": float(mean_metrics[2].item()),
             "psnr_rd": float(mean_metrics[3].item()),
@@ -920,9 +940,11 @@ class Wan22Trainer:
                         metrics = self.evaluate()
                         self.accelerator.wait_for_everyone()
                         if metrics is not None and self.accelerator.is_main_process:
-                            description = "[eval] step=%d val_loss=%.4f infer_psnr=%.4f infer_ssim=%.4f" % (
+                            description = "[eval] step=%d val_loss=%.4f val_loss_video=%.4f val_loss_action=%.4f infer_psnr=%.4f infer_ssim=%.4f" % (
                                 self.global_step,
                                 metrics["val_loss"],
+                                metrics.get("val_loss_video", 0.0),
+                                metrics.get("val_loss_action", 0.0),
                                 metrics["psnr_rd"],
                                 metrics["ssim_rd"],
                             )

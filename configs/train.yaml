@@ -20,7 +20,7 @@ num_epochs: 1
 max_steps: null
 log_every: 10
 save_every: 100
-eval_every: 10
+eval_every: 200
 eval_num_inference_steps: 10
 
 # training
@@ -30,7 +30,7 @@ seed: 42
 max_grad_norm: 1.0
 weight_decay: 0.0
 # resume: null
-resume: "/apdcephfs_tj5/share_302528826/xxd/nav_vln_1e-4/2026-05-19_15-49-20/checkpoints/state/step_003100"
+resume: "/apdcephfs_tj5/share_302528826/xxd/nav_vln_1e-4/2026-05-21_01-49-23/checkpoints/state/step_000200"
 
 # wandb
 wandb:
