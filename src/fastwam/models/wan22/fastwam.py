@@ -635,7 +635,9 @@ class FastWAM(torch.nn.Module):
         )
         loss_video = (loss_video_per_sample * video_weight).mean()
 
-        action_loss_token = F.mse_loss(pred_action.float(), target_action.float(), reduction="none").mean(dim=2) # [B, T]
+        # Per-dimension weighting: upweight d_theta (dim 2) to address yaw prediction bottleneck
+        _action_dim_weights = torch.tensor([1.0, 1.0, 3.0, 1.0], device=pred_action.device, dtype=pred_action.dtype)
+        action_loss_token = (F.mse_loss(pred_action.float(), target_action.float(), reduction="none") * _action_dim_weights).mean(dim=2) # [B, T]
         # No masking of padded steps — the 4th action dimension (moving flag) encodes
         # stop signal directly (0=stopped), so all steps are valid training targets.
         action_loss_per_sample = action_loss_token.mean(dim=1)

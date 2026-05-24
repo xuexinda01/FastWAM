@@ -30,7 +30,7 @@ seed: 42
 max_grad_norm: 1.0
 weight_decay: 0.0
 # resume: null
-resume: "/apdcephfs_tj5/share_302528826/xxd/nav_vln_1e-4/2026-05-21_01-49-23/checkpoints/state/step_000200"
+resume: null
 
 # wandb
 wandb:

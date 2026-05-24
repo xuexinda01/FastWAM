@@ -62,5 +62,5 @@ action_scheduler:
   num_train_timesteps: 1000
 
 loss:
-  lambda_action: 1.0
-  action_loss_detach_video_expert: true
+  lambda_action: 2.0
+  action_loss_detach_video_expert: false
