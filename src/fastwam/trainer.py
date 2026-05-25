@@ -96,6 +96,10 @@ class Wan22Trainer:
         proprio_encoder = getattr(self.model, "proprio_encoder", None)
         if proprio_encoder is not None:
             dit_params.extend(list(proprio_encoder.parameters()))
+        # Include image_projector params for action-only model
+        image_projector = getattr(self.model, "image_projector", None)
+        if image_projector is not None:
+            dit_params.extend(list(image_projector.parameters()))
 
         param_groups = [
             {"params": dit_params, "lr": self.learning_rate},
@@ -408,6 +412,11 @@ class Wan22Trainer:
             if proj_params:  # has MLP (not skip_projection mode)
                 model.visual_encoder.projection.train()
                 model.visual_encoder.projection.requires_grad_(True)
+
+        # If action-only model, unfreeze image_projector
+        if hasattr(model, "image_projector"):
+            model.image_projector.train()
+            model.image_projector.requires_grad_(True)
 
     @staticmethod
     def _to_batched_eval_sample(sample):

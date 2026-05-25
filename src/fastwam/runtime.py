@@ -169,6 +169,57 @@ def create_fastwam(
     )
 
 
+def create_fastwam_action_only(
+    model_id: str = "Wan-AI/Wan2.2-TI2V-5B",
+    tokenizer_model_id: str = "Wan-AI/Wan2.1-T2V-1.3B",
+    tokenizer_max_len: int = 256,
+    action_dit_config=None,
+    action_dit_pretrained_path: str | None = None,
+    skip_dit_load_from_pretrain: bool = False,
+    action_scheduler=None,
+    loss=None,
+    redirect_common_files: bool = True,
+    n_image_tokens: int = 64,
+    model_dtype: torch.dtype = torch.bfloat16,
+    device: str = "cuda",
+    **kwargs,  # accept and ignore extra config keys for compatibility
+):
+    """Create action-only FastWAM (no video expert, no MoT)."""
+    from .models.wan22.fastwam_action_only import FastWAMActionOnly
+
+    if isinstance(action_dit_config, DictConfig):
+        action_dit_config = OmegaConf.to_container(action_dit_config, resolve=True)
+    if action_dit_config is None:
+        action_dit_config = {}
+
+    if isinstance(action_scheduler, DictConfig):
+        action_scheduler = OmegaConf.to_container(action_scheduler, resolve=True)
+    if action_scheduler is None:
+        action_scheduler = {}
+
+    if isinstance(loss, DictConfig):
+        loss = OmegaConf.to_container(loss, resolve=True)
+    if loss is None:
+        loss = {}
+
+    return FastWAMActionOnly.from_config(
+        device=device,
+        torch_dtype=model_dtype,
+        model_id=model_id,
+        tokenizer_model_id=tokenizer_model_id,
+        tokenizer_max_len=int(tokenizer_max_len),
+        redirect_common_files=bool(redirect_common_files),
+        action_dit_config=action_dit_config,
+        action_dit_pretrained_path=action_dit_pretrained_path,
+        skip_dit_load_from_pretrain=bool(skip_dit_load_from_pretrain),
+        action_train_shift=float(action_scheduler.get("train_shift", 5.0)),
+        action_infer_shift=float(action_scheduler.get("infer_shift", 5.0)),
+        action_num_train_timesteps=int(action_scheduler.get("num_train_timesteps", 1000)),
+        loss_lambda_action=float(loss.get("lambda_action", 1.0)),
+        n_image_tokens=int(n_image_tokens),
+    )
+
+
 def create_fastwam_joint(
     model_id: str,
     tokenizer_model_id: str,
