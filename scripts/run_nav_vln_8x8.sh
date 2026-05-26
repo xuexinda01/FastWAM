@@ -60,7 +60,7 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
 # Task-specific settings (from the verified single-GPU debug config)
 TASK="nav_vln_1e-4"
-MODEL="fastwam_nav"
+MODEL="fastwam_nav_action_only"
 DATA="nav_vln"
 OUTPUT_BASE="${OUTPUT_DIR:-/apdcephfs_tj5/share_302528826/xxd/nav_vln_1e-4}"
 WANDB_NAME="${WANDB_NAME:-nav_vln_1e-4_8x8}"

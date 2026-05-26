@@ -362,6 +362,12 @@ class Wan22Trainer:
         if proprio_encoder is not None:
             proprio_encoder.train()
             proprio_encoder.requires_grad_(True)
+        # Action-only model: unfreeze image_projector BEFORE DeepSpeed init
+        # so ZeRO-2 allocates proper optimizer state for it.
+        image_projector = getattr(model, "image_projector", None)
+        if image_projector is not None:
+            image_projector.train()
+            image_projector.requires_grad_(True)
         if getattr(model, "use_visual_encoder", False) and not self.freeze_visual_encoder:
             proj_params = list(model.visual_encoder.projection.parameters())
             if proj_params:  # has MLP (not skip_projection mode)

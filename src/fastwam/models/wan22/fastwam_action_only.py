@@ -27,29 +27,35 @@ logger = get_logger(__name__)
 
 
 class ImageProjector(nn.Module):
-    """Project VAE latent of a single frame into context tokens for ActionDiT.
+    """Project VAE latents into context tokens for ActionDiT.
 
-    VAE latent shape: [B, C=16, 1, H_lat, W_lat] (e.g. 16×28×28 for 224px)
-    Output: [B, n_tokens, text_dim]
+    Mirrors the video_expert's patch_embedding (Conv3d stride=(1,2,2)) to produce
+    the same number of tokens (3×14×14=588), but replaces the 30-layer video
+    transformer with a simple MLP projection.
+
+    Input: VAE latent [B, C=48, T_lat=3, H_lat=28, W_lat=28]
+           (9 condition frames → VAE temporal compression → 3 latent frames)
+    Output: [B, 588, text_dim=4096]
     """
 
     def __init__(
         self,
-        vae_channels: int = 16,
-        latent_h: int = 28,
-        latent_w: int = 28,
+        vae_channels: int = 48,
         text_dim: int = 4096,
-        n_tokens: int = 64,
+        patch_size: tuple = (1, 2, 2),  # same as video_expert patch_embedding
     ):
         super().__init__()
-        self.n_tokens = n_tokens
-        # Spatial pooling: [B, C, H, W] → [B, C, h, w] where h*w = n_tokens
-        pool_h = 8
-        pool_w = n_tokens // pool_h  # 64/8=8
-        self.pool = nn.AdaptiveAvgPool2d((pool_h, pool_w))
-        # Project: [B, n_tokens, C] → [B, n_tokens, text_dim]
+        patch_dim = vae_channels * patch_size[0] * patch_size[1] * patch_size[2]
+        # Conv3d patchify: same as video_expert.patch_embedding but projects to text_dim
+        self.patch_conv = nn.Conv3d(
+            vae_channels, text_dim,
+            kernel_size=patch_size,
+            stride=patch_size,
+        )
+        # Extra MLP for capacity (since we don't have 30 transformer layers)
         self.proj = nn.Sequential(
-            nn.Linear(vae_channels, text_dim),
+            nn.LayerNorm(text_dim),
+            nn.Linear(text_dim, text_dim),
             nn.GELU(approximate='tanh'),
             nn.Linear(text_dim, text_dim),
         )
@@ -57,16 +63,16 @@ class ImageProjector(nn.Module):
     def forward(self, vae_latent: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            vae_latent: [B, C, 1, H, W] or [B, C, H, W]
+            vae_latent: [B, 48, T_lat, H_lat, W_lat] (e.g. [B, 48, 3, 28, 28])
         Returns:
-            [B, n_tokens, text_dim]
+            [B, T_lat * (H_lat//2) * (W_lat//2), text_dim]  = [B, 588, 4096]
         """
-        if vae_latent.ndim == 5:
-            vae_latent = vae_latent[:, :, 0]  # [B, C, H, W]
-        x = self.pool(vae_latent)  # [B, C, pool_h, pool_w]
-        B, C, H, W = x.shape
-        x = x.permute(0, 2, 3, 1).reshape(B, H * W, C)  # [B, n_tokens, C]
-        x = self.proj(x)  # [B, n_tokens, text_dim]
+        # Patchify: [B, 48, 3, 28, 28] → [B, 4096, 3, 14, 14]
+        x = self.patch_conv(vae_latent)
+        B, C, T, H, W = x.shape
+        # Reshape to tokens: [B, T*H*W, C]
+        x = x.permute(0, 2, 3, 4, 1).reshape(B, T * H * W, C)
+        x = self.proj(x)
         return x
 
 
@@ -183,13 +189,11 @@ class FastWAMActionOnly(nn.Module):
 
         text_dim = int(action_dit_config["text_dim"])
 
-        # Image projector (VAE latent → context tokens)
+        # Image projector (VAE latent → context tokens, same patchify as video expert)
         image_projector = ImageProjector(
-            vae_channels=16,
-            latent_h=28,  # 224/8
-            latent_w=28,
+            vae_channels=48,
             text_dim=text_dim,
-            n_tokens=n_image_tokens,
+            patch_size=(1, 2, 2),  # same as video_expert.patch_embedding
         ).to(device=device, dtype=torch_dtype)
 
         model = cls(
@@ -208,32 +212,34 @@ class FastWAMActionOnly(nn.Module):
         logger.info(
             f"FastWAMActionOnly: ActionDiT params={sum(p.numel() for p in action_expert.parameters())/1e6:.0f}M, "
             f"ImageProjector params={sum(p.numel() for p in image_projector.parameters())/1e6:.1f}M, "
-            f"n_image_tokens={n_image_tokens}"
+            f"n_image_tokens=588 (3×14×14, same as video expert)"
         )
         return model
 
     @torch.no_grad()
-    def _encode_condition_image(self, video: torch.Tensor) -> torch.Tensor:
-        """Encode the first frame of video using VAE.
+    def _encode_condition_frames(self, video: torch.Tensor) -> torch.Tensor:
+        """Encode all 9 condition frames using VAE.
+
+        Same as the full model: 9 RGB frames → VAE temporal compression → 3 latent frames.
 
         Args:
-            video: [B, C=3, T, H, W] in [-1, 1]
+            video: [B, C=3, T=17, H, W] in [-1, 1] (9 cond + 8 future)
         Returns:
-            vae_latent: [B, 16, 1, H_lat, W_lat]
+            vae_latent: [B, 48, 3, 28, 28] (3 temporal latent frames)
         """
-        # Take first frame: [B, 3, H, W]
-        first_frame = video[:, :, 0]
-        # VAE expects [B, C, T, H, W]
-        frame_5d = first_frame.unsqueeze(2)  # [B, 3, 1, H, W]
+        # Take condition frames (first 9): [B, 3, 9, H, W]
+        n_cond_frames = 9
+        cond_video = video[:, :, :n_cond_frames]
         z = self.vae.encode(
-            frame_5d.to(device=self.device, dtype=self.torch_dtype),
+            cond_video.to(device=self.device, dtype=self.torch_dtype),
             device=self.device,
         )
         if isinstance(z, list):
             z = z[0]
         if z.ndim == 4:
             z = z.unsqueeze(0)
-        return z  # [B, 16, 1, H_lat, W_lat]
+        # z shape: [B, 48, T_lat, H_lat, W_lat] where T_lat = (9+3)//4 = 3
+        return z
 
     def _build_context(
         self,
@@ -247,9 +253,9 @@ class FastWAMActionOnly(nn.Module):
             context: [B, N_img + N_text, text_dim]
             context_mask: [B, N_img + N_text]
         """
-        # Encode condition image
-        vae_latent = self._encode_condition_image(video)
-        img_tokens = self.image_projector(vae_latent)  # [B, N_img, text_dim]
+        # Encode condition frames (all 9 → 3 latent frames)
+        vae_latent = self._encode_condition_frames(video)
+        img_tokens = self.image_projector(vae_latent)  # [B, 588, text_dim]
 
         # Concat: [image_tokens, text_tokens]
         context = torch.cat([img_tokens, text_context], dim=1)
@@ -333,6 +339,42 @@ class FastWAMActionOnly(nn.Module):
             loss_dict["wp_xy_mae_smallsig_m"] = float('nan')
 
         return loss_total, loss_dict
+
+    def save_checkpoint(self, path, optimizer=None, step=None):
+        """Save trainable weights (action_expert + image_projector)."""
+        payload = {
+            "action_expert": self.action_expert.state_dict(),
+            "image_projector": self.image_projector.state_dict(),
+            "step": step,
+            "torch_dtype": str(self.torch_dtype),
+        }
+        if optimizer is not None:
+            payload["optimizer"] = optimizer.state_dict()
+        torch.save(payload, path)
+        logger.info(f"Saved action-only checkpoint to {path} (step={step})")
+
+    def load_checkpoint(self, path, optimizer=None):
+        """Load trainable weights (action_expert + image_projector)."""
+        payload = torch.load(path, map_location=self.device)
+        if "action_expert" in payload:
+            self.action_expert.load_state_dict(payload["action_expert"], strict=False)
+            logger.info("Loaded `action_expert` weights from checkpoint.")
+        elif "mot" in payload:
+            # Legacy: full-model checkpoint — try to load action expert from mot
+            logger.warning("Loading legacy full-model checkpoint; extracting action_expert keys.")
+            action_keys = {k.replace("action_expert.", ""): v
+                          for k, v in payload["mot"].items()
+                          if k.startswith("action_expert.")}
+            if action_keys:
+                self.action_expert.load_state_dict(action_keys, strict=False)
+        if "image_projector" in payload:
+            self.image_projector.load_state_dict(payload["image_projector"], strict=True)
+            logger.info("Loaded `image_projector` weights from checkpoint.")
+        else:
+            logger.warning("Checkpoint has no `image_projector` weights; keeping random init.")
+        if optimizer is not None and "optimizer" in payload:
+            optimizer.load_state_dict(payload["optimizer"])
+        return payload
 
     @torch.no_grad()
     def infer_action(
