@@ -549,7 +549,12 @@ class Wan22Trainer:
 
         # When using a non-VAE visual encoder (DINO / V-JEPA2), video decode
         # is unavailable, so we skip inference, video metrics and VAE recon.
-        _can_decode_video = not getattr(model, "use_visual_encoder", False)
+        # Also skip for action-only model (FastWAMActionOnly) which has no video expert.
+        _is_action_only = hasattr(model, "image_projector") and not hasattr(model, "video_expert")
+        _can_decode_video = (
+            not getattr(model, "use_visual_encoder", False)
+            and not _is_action_only
+        )
 
         prompt = sample["prompt"][0] if sample.get("prompt") is not None else None
         video0 = sample["video"][0] # Tensor [3, T, H, W] in (-1, 1)
@@ -606,6 +611,21 @@ class Wan22Trainer:
 
             psnr_rollout_vs_gt = video_psnr(pred=pred_video_tensor, target=gt_video_tensor)
             ssim_rollout_vs_gt = video_ssim(pred=pred_video_tensor, target=gt_video_tensor)
+
+        elif _is_action_only:
+            # Action-only model: run action inference without video
+            infer_kwargs = {
+                "input_image": input_image,
+                "num_frames": num_frames,
+                "num_inference_steps": self.eval_num_inference_steps,
+                "seed": 42,
+                "tiled": False,
+            }
+            if sample["context"] is not None:
+                infer_kwargs["context"] = sample["context"][0]
+                infer_kwargs["context_mask"] = sample["context_mask"][0]
+            pred = model.infer(**infer_kwargs)
+            pred_action = pred.get("action", None)
 
         action_l1 = None
         action_l2 = None

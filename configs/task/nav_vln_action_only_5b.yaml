@@ -1,7 +1,7 @@
 # @package _global_
 
-# dataloading
-batch_size: 20
+# dataloading — reduced batch_size for 5B model (higher VRAM usage)
+batch_size: 8
 num_workers: 4
 
 model:
@@ -9,7 +9,7 @@ model:
 
 # scheduler
 lr_scheduler_type: "cosine"
-learning_rate: 1e-4
+learning_rate: 5e-5
 num_epochs: 10
 max_steps: null
 log_every: 10
@@ -20,5 +20,4 @@ n_eval_samples_per_gpu: 4
 # training
 gradient_accumulation_steps: 4
 weight_decay: 1e-2
-resume: /apdcephfs_tj5/share_302528826/xxd/nav_vln_1e-4/2026-05-27_01-21-22/checkpoints/state/step_000300
-
+resume: null

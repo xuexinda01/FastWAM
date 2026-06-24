@@ -1,0 +1,133 @@
+# Model config: H-FastWAM v2 for Nav VLN (5B Wan2.2 + 3-expert MoT)
+#
+# Three-expert architecture (language ‖ video ‖ action) on top of MoT,
+# routed through fastwam.models.hfastwam_v2 (the May-26 HFastWAM
+# implementation copied from /HFastWAM into FastWAM under its own
+# namespace). The legacy fastwam.models.hfastwam folder is left untouched
+# so the existing hfastwam.yaml + run_nav_vln_8x8.sh keep working.
+#
+# This config is purpose-built for the nav_vln_hfastwam data config:
+#   * VAE-encoded video path (visual_encoder_config: null) — same as
+#     fastwam_nav.yaml, since nav_video_dataset emits raw RGB frames
+#     for VAE encoding.
+#   * action_dim=4 (nav_video_dataset hard-codes 4D actions).
+#   * language_backend=legacy: random-init transformer that lives inside
+#     MoT and is grounded via shared self-attention with the video
+#     expert's first-frame tokens (no separate vision encoder).
+#   * training_phase=full: all three experts trained jointly (the
+#     language expert is still gradient-isolated from video/action via
+#     knowledge_insulation).
+
+_target_: fastwam.runtime.create_hfastwam_v2
+
+# Base Wan2.2 model
+model_id: Wan-AI/Wan2.2-TI2V-5B
+tokenizer_model_id: Wan-AI/Wan2.1-T2V-1.3B
+tokenizer_max_len: 256
+load_text_encoder: false
+redirect_common_files: true
+mot_checkpoint_mixed_attn: true
+
+# No proprio in nav data
+proprio_dim: null
+
+# No external pretrain checkpoint; load Wan2.2 weights as usual.
+fastwam_checkpoint: null
+pretrain_checkpoint: null
+skip_video_dit_load_from_pretrain: false
+skip_dit_load_from_pretrain: false
+
+# Use VAE path (consistent with nav_video_dataset video output).
+visual_encoder_config: null
+
+# Language Expert — random-init, hidden_dim auto-aligned with video
+# expert (3072) inside HFastWAM.from_pretrained_fastwam.
+language_backend: legacy
+language_vocab_size: 32000
+language_max_task_len: 128
+language_max_subtask_len: 128
+
+# Training phase: "language_video" (warm-start) or "full" (joint).
+training_phase: full
+
+# Knowledge insulation: language K/V is detached from video/action queries
+# so the FM losses cannot corrupt language weights.
+knowledge_insulation: true
+
+# Strict-mode shape compat across experts (legacy backend matches).
+strict_expert_compat: true
+layer_alignment_mode: strict
+shared_attention_expert: video
+
+# Video Expert (Wan2.2 TI2V-5B DiT, VAE latent path: in_dim=48).
+video_dit_config:
+  has_image_input: false
+  patch_size: [1, 2, 2]
+  in_dim: 48
+  hidden_dim: 3072
+  ffn_dim: 14336
+  freq_dim: 256
+  text_dim: 4096
+  out_dim: 48
+  num_heads: 24
+  attn_head_dim: 128
+  num_layers: 30
+  eps: 1.0e-06
+  seperated_timestep: true
+  require_clip_embedding: false
+  require_vae_embedding: false
+  fuse_vae_embedding_in_latents: true
+  use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}
+  video_attention_mask_mode: "first_frame_causal"
+  action_conditioned: false
+  action_dim: 4
+  action_group_causal_mask_mode: "group_diagonal"
+
+# Action Expert — same shape as fastwam_nav.yaml's ActionDiT.
+action_dit_config:
+  action_dim: 4
+  hidden_dim: 1024
+  ffn_dim: 4096
+  num_heads: 24
+  attn_head_dim: 128
+  num_layers: 30
+  text_dim: 4096
+  freq_dim: 256
+  eps: 1.0e-06
+  use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}
+
+# No pretrained ActionDiT (5B architecture incompatible with old 1024hdim ckpt)
+action_dit_pretrained_path: null
+
+# Schedulers
+video_scheduler:
+  train_shift: 5.0
+  infer_shift: 5.0
+  num_train_timesteps: 1000
+
+action_scheduler:
+  train_shift: 5.0
+  infer_shift: 5.0
+  num_train_timesteps: 1000
+
+# Loss weights — tweak per phase.
+loss_config:
+  lambda_language: 1.0
+  lambda_video: 1.0
+  lambda_action: 1.0
+
+# Action loss / stop-supervision behaviour.
+#
+# nav_video_dataset packs the stop signal as a 4th action channel
+# (moving_flag = ~action_is_pad). With this flag set to FALSE we ignore
+# action_is_pad in the action loss and treat all 8 steps as labeled —
+# stop steps then receive direct supervision against their GT
+# (0,0,0,0,0). This matches the action-only training (run_nav_vln_8x8.sh)
+# semantics. Set to TRUE only if you instead want action_is_pad to act
+# as a true padding mask.
+mask_stop_in_action_loss: false
+
+# Freeze flags (default: train all three experts).
+freeze_language_expert: false
+freeze_video_expert: false
+freeze_action_expert: false

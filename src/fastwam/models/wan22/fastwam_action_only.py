@@ -377,6 +377,86 @@ class FastWAMActionOnly(nn.Module):
         return payload
 
     @torch.no_grad()
+    def infer(
+        self,
+        input_image: torch.Tensor,
+        num_frames: int = 17,
+        context: Optional[torch.Tensor] = None,
+        context_mask: Optional[torch.Tensor] = None,
+        num_inference_steps: int = 20,
+        action_horizon: Optional[int] = None,
+        action_dim: int = 4,
+        # Accept and ignore full-model kwargs for compatibility
+        prompt: Optional[str] = None,
+        action: Optional[torch.Tensor] = None,
+        proprio: Optional[torch.Tensor] = None,
+        negative_prompt: Optional[str] = None,
+        text_cfg_scale: float = 1.0,
+        action_cfg_scale: float = 1.0,
+        sigma_shift: Optional[float] = None,
+        seed: Optional[int] = None,
+        rand_device: str = "cpu",
+        tiled: bool = False,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """Inference interface compatible with trainer.evaluate().
+
+        Returns {"video": list_of_pil_frames, "action": tensor [1, T, D]}.
+        Video is a dummy (black frames) since this model doesn't generate video.
+        """
+        from PIL import Image
+
+        self.eval()
+        B = 1  # eval is always batch_size=1
+
+        # Move inputs to model device
+        input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
+
+        # Build a fake "video" tensor from input_image for _encode_condition_frames
+        # input_image: [1, 3, H, W] — repeat to 9 condition frames
+        if input_image.ndim == 3:
+            input_image = input_image.unsqueeze(0)
+        # Create [1, 3, 17, H, W] with the input image repeated for cond frames
+        H, W = input_image.shape[-2:]
+        cond_frames = input_image.unsqueeze(2).expand(-1, -1, 9, -1, -1)  # [1, 3, 9, H, W]
+        # Pad to 17 frames for _encode_condition_frames (it only uses first 9)
+        pad_frames = torch.zeros(1, 3, 8, H, W, device=self.device, dtype=self.torch_dtype)
+        video_tensor = torch.cat([cond_frames, pad_frames], dim=2)  # [1, 3, 17, H, W]
+
+        # Context
+        if context is not None:
+            context = context.to(device=self.device, dtype=self.torch_dtype)
+            if context.ndim == 2:
+                context = context.unsqueeze(0)  # [1, seq_len, dim]
+            if context_mask is not None:
+                context_mask = context_mask.to(device=self.device)
+                if context_mask.ndim == 1:
+                    context_mask = context_mask.unsqueeze(0)
+        else:
+            # Dummy context (zeros)
+            context = torch.zeros(1, 256, self.text_dim, device=self.device, dtype=self.torch_dtype)
+            context_mask = torch.ones(1, 256, dtype=torch.bool, device=self.device)
+
+        # Infer action
+        _action_horizon = action_horizon if action_horizon is not None else 8
+        pred_action = self.infer_action(
+            video=video_tensor,
+            context=context,
+            context_mask=context_mask,
+            num_inference_steps=num_inference_steps,
+            action_dim=action_dim,
+            action_horizon=_action_horizon,
+        )  # [1, T, D]
+
+        # Dummy video output (black frames) for compatibility with trainer eval
+        dummy_frames = [Image.new("RGB", (W, H), (0, 0, 0)) for _ in range(num_frames)]
+
+        return {
+            "video": dummy_frames,
+            "action": pred_action,  # [1, T, D]
+        }
+
+    @torch.no_grad()
     def infer_action(
         self,
         video: torch.Tensor,

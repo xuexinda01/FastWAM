@@ -467,6 +467,34 @@ def create_fastwam_idm(
     )
 
 
+def create_hfastwam_v2(
+    *,
+    model_dtype: torch.dtype = torch.bfloat16,
+    device: str = "cuda",
+    **kwargs,
+):
+    """Create the new H-FastWAM (3-expert MoT) model from `fastwam.models.hfastwam_v2`.
+
+    Thin wrapper around
+    :py:meth:`fastwam.models.hfastwam_v2.HFastWAM.from_pretrained_fastwam`.
+    All other kwargs (``video_dit_config``, ``action_dit_config``,
+    ``visual_encoder_config``, ``language_backend`` …) are forwarded
+    verbatim — `from_pretrained_fastwam` already handles ``DictConfig`` →
+    ``dict`` coercion internally.
+
+    This entry point is **purely additive**: existing factories
+    (``create_fastwam``, ``create_fastwam_action_only`` …) and the legacy
+    ``fastwam.models.hfastwam`` namespace are untouched.
+    """
+    from .models.hfastwam_v2 import HFastWAM
+
+    return HFastWAM.from_pretrained_fastwam(
+        device=device,
+        torch_dtype=model_dtype,
+        **kwargs,
+    )
+
+
 def build_datasets(data_cfg: DictConfig):
     train_ds = instantiate(data_cfg.train)
     if data_cfg.get("val") is None:

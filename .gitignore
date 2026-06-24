@@ -258,3 +258,49 @@ visualizations/
 scripts/_verify_out/
 scripts/_action_stats.json
 token.txt
+
+# Model weights and checkpoints
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+pretrained/
+weights/
+models/
+
+# Training results and logs
+results/
+test_results/
+benchmark_results/
+profiling_results/
+wandb/
+mlruns/
+
+# Cache and temporary files
+.cache/
+.cctmp/
+.cctmp*/
+
+
+# Model weights and checkpoints
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+pretrained/
+weights/
+models/
+
+# Training results and logs
+results/
+test_results/
+benchmark_results/
+profiling_results/
+wandb/
+mlruns/
+
+# Cache and temporary files
+.cache/
+.cctmp/
+.cctmp*/
+

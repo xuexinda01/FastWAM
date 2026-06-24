@@ -1,0 +1,30 @@
+_target_: fastwam.runtime.create_fastwam_action_only
+model_id: Wan-AI/Wan2.2-TI2V-5B
+tokenizer_model_id: Wan-AI/Wan2.1-T2V-1.3B
+tokenizer_max_len: 256
+redirect_common_files: true
+# No pretrained ActionDiT weights (5B architecture incompatible with 1024hdim checkpoint)
+action_dit_pretrained_path: ""
+skip_dit_load_from_pretrain: true
+n_image_tokens: 64
+
+action_dit_config:
+  action_dim: 4
+  hidden_dim: 3072
+  ffn_dim: 14336
+  num_heads: 24
+  attn_head_dim: 128
+  num_layers: 30
+  text_dim: 4096
+  freq_dim: 256
+  eps: 1.0e-06
+  use_gradient_checkpointing: true
+  predict_stop: false
+
+action_scheduler:
+  train_shift: 5.0
+  infer_shift: 5.0
+  num_train_timesteps: 1000
+
+loss:
+  lambda_action: 1.0
